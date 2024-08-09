@@ -32,7 +32,7 @@ impl PoincareTaxonomyEmbeddingModelConfig {
 
 impl<B: Backend> PoincareTaxonomyEmbeddingModel<B> {
     // Defines forward pass for training
-    pub fn forward(&self, pairs: Tensor<B, 2, Int>) -> Tensor<B, 3, Float> {
+    pub fn forward(&self, pairs: Tensor<B, 2, Int>) -> Tensor<B, 2, Float> {
         let dims = pairs.dims();
         // println!("{:?}", dims);
         // println!("{}", pairs);
@@ -56,21 +56,26 @@ impl<B: Backend> PoincareTaxonomyEmbeddingModel<B> {
     }
 }
 
-pub fn poincare_distance<B: Backend>(x: Tensor<B, 3>, y: Tensor<B, 3>) -> Tensor<B, 3> {
+pub fn poincare_distance<B: Backend>(x: Tensor<B, 3>, y: Tensor<B, 3>) -> Tensor<B, 2> {
     let device = x.device();
 
-    // let x_norm = l2_norm(x.clone()).clamp(0.0, 1.0 - 1e-5);
-    // let y_norm = l2_norm(y.clone()).clamp(0.0, 1.0 - 1e-5);
+    let x_norm = l2_norm(x.clone()).clamp(0.0, 1.0 - 1e-5);
+    let y_norm = l2_norm(y.clone()).clamp(0.0, 1.0 - 1e-5);
 
     let diff = x - y;
     println!("Diff: {}", diff);
     // let diff = diff.powf(Tensor::<B, 3>::from_floats([[[2.0]]], &device));
+    let diff = l2_norm(diff.clone());
     let diff = diff.powf_scalar(2.0);
-    println!("Diff powf: {}", diff);
-    // let diff = diff.sum_dim(3);
 
-    // todo the rest, just seend what works right now though
-    diff
+    let num = diff * 2.0;
+    let one = Tensor::<B, 2>::ones([1, 1], &device); // Create a tensor with value 1.0
+    let denom = (one.clone() - x_norm.clone().powf_scalar(2.0)) * (one.clone() - y_norm.clone().powf_scalar(2.0));
+    let distance = num / denom;
+
+    let result = acosh(distance);
+
+    result
 }
 
 /// Calculate the L2 norm of a tensor
@@ -82,10 +87,31 @@ pub fn poincare_distance<B: Backend>(x: Tensor<B, 3>, y: Tensor<B, 3>) -> Tensor
 /// A tensor of shape [batch_size] containing the L2 norm of each row in `x`
 ///
 pub fn l2_norm<B: Backend>(x: Tensor<B, 3>) -> Tensor<B, 2> {
-    let device = x.device();
+    // let device = x.device();
     let data = x.powf_scalar(2.0).sum_dim(2).sqrt();
     let dims = data.dims();
     println!("L2 Norm Dims: {:?}", dims);
     println!("L2 Norm Data: {}", data);
     data.squeeze(1)
+}
+
+fn acosh<B: Backend>(x: Tensor<B, 2>) -> Tensor<B, 2> {
+    // let device = x.device();
+
+    // Compute x^2
+    let x_squared = x.clone().powf_scalar(2.0);
+    
+    // Compute the inside of the square root: x^2 - 1
+    let inside_sqrt = x_squared.clone() - Tensor::<B, 2>::ones_like(&x_squared);
+    
+    // Compute the square root
+    let sqrt_term = inside_sqrt.sqrt();
+    
+    // Compute x + sqrt(x^2 - 1)
+    let add_term = x + sqrt_term;
+    
+    // Compute ln(x + sqrt(x^2 - 1))
+    let acosh_result = add_term.log();
+    
+    acosh_result
 }

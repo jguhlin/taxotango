@@ -4,7 +4,6 @@ use petgraph::algo::astar;
 use petgraph::prelude::*;
 // Uses too much memory
 // use petgraph::algo::floyd_warshall;
-use acc2tax::parser::parse_names;
 use rand::prelude::*;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use rayon::prelude::*;
@@ -239,4 +238,43 @@ pub fn parse_nodes(filename: String) -> (Vec<(u32, u32)>, Vec<String>) {
     taxon_rank.shrink_to_fit();
 
     (taxon_to_parent, taxon_rank)
+}
+
+pub fn parse_names(filename: String) -> (Vec<String>, Vec<u32>) {
+    let mut names: Vec<String> = Vec::with_capacity(3_006_098);
+
+    let reader = BufReader::new(File::open(filename).expect("Unable to open taxonomy names file"));
+
+    let lines = reader.lines();
+    let mut taxids = HashSet::new();
+
+    for line in lines {
+        let split = line
+            .expect("Error reading line")
+            .split('|')
+            .map(|x| x.trim().to_string())
+            .collect::<Vec<String>>();
+
+        let id: usize = split[0].parse().expect("Error converting to number");
+        let name: &str = &split[1];
+        let class: &str = &split[3];
+
+        match names.get(id) {
+            None => {
+                names.resize(id + 1, "".to_string());
+                names[id] = name.into();
+                taxids.insert(id as u32);
+            }
+            Some(_) => {
+                if class == "scientific name" {
+                    names[id] = name.into();
+                }
+            }
+        };
+    }
+
+    let mut taxids = taxids.into_iter().collect::<Vec<u32>>();
+    taxids.sort_unstable();
+
+    (names, taxids)
 }
