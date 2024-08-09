@@ -153,8 +153,8 @@ pub struct BatchGenerator {
     graph: Graph<u32, (), Undirected, u32>,
     rng: Xoshiro256PlusPlus,
     batch_size: usize,
-    nodes: Vec<u32>,
-    levels: HashMap<u32, TaxaLevel>,
+    pub nodes: Vec<u32>,
+    pub levels: HashMap<u32, TaxaLevel>,
 }
 
 impl BatchGenerator {

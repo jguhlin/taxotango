@@ -9,7 +9,7 @@ fn main() {
     let nodes_file = "/mnt/data/data/nt/taxdmp/nodes.dmp";
     let names_file = "/mnt/data/data/nt/taxdmp/names.dmp";
 
-    // let mut batch_gen = build_taxonomy_graph(nodes_file, names_file);
+    let mut batch_gen = build_taxonomy_graph(nodes_file, names_file);
 
     // log::debug!("Generating first test batch");
 
@@ -17,8 +17,8 @@ fn main() {
     // println!("{:?}", batch);
 
     let config = PoincareTaxonomyEmbeddingModelConfig {
-        taxonomy_size: 10,
-        embedding_size: 8,
+        taxonomy_size: batch_gen.nodes.len(),
+        embedding_size: 16,
     };
 
     type MyBackend = Wgpu<AutoGraphicsApi, f32, i32>;
