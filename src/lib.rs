@@ -9,7 +9,7 @@ use rand::prelude::*;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use rayon::prelude::*;
 
-use std::collections::{HashSet, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 
@@ -18,7 +18,6 @@ type Backend = Wgpu;
 
 pub mod model;
 pub use model::*;
-
 
 #[derive(PartialEq, PartialOrd, Eq, Ord, Debug)]
 pub enum TaxaLevel {
@@ -142,7 +141,13 @@ pub fn build_taxonomy_graph(nodes_file: &str, names_file: &str) -> BatchGenerato
         graph.edge_count()
     );
 
-    BatchGenerator::new(graph, Xoshiro256PlusPlus::seed_from_u64(1337), 1024, nodes, levels)
+    BatchGenerator::new(
+        graph,
+        Xoshiro256PlusPlus::seed_from_u64(1337),
+        1024,
+        nodes,
+        levels,
+    )
 }
 
 pub struct BatchGenerator {
@@ -186,19 +191,22 @@ impl BatchGenerator {
             pairs.push((idx, idx2));
         }
 
-        pairs.par_iter().map(|(idx, idx2)| {
-            let dist =
-            astar(
-                &self.graph,
-                (*idx).into(),
-                |finish| finish == (*idx2).into(),
-                |_| 1,
-                |_| 0,
-            )
-            .map(|x| x.1)
-            .expect(format!("No path found - {} - {}", idx, idx2).as_str()).len();
-        (idx.clone(), idx2.clone(), dist)
-        }).collect_into_vec(&mut batch);
+        pairs
+            .par_iter()
+            .map(|(idx, idx2)| {
+                let dist = astar(
+                    &self.graph,
+                    (*idx).into(),
+                    |finish| finish == (*idx2).into(),
+                    |_| 1,
+                    |_| 0,
+                )
+                .map(|x| x.1)
+                .expect(format!("No path found - {} - {}", idx, idx2).as_str())
+                .len();
+                (idx.clone(), idx2.clone(), dist)
+            })
+            .collect_into_vec(&mut batch);
 
         batch
     }
