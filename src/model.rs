@@ -39,8 +39,12 @@ impl<B: Backend> PoincareTaxonomyEmbeddingModel<B> {
         // println!("Pairs sliced: {}", pairs.clone().slice([0..dims[0], 0..1]));
 
         // Calculate the Poincaré distance
-        let x = self.embedding_token.forward(pairs.clone().slice([0..dims[0], 0..1]));
-        let y = self.embedding_token.forward(pairs.slice([0..dims[0], 1..2]));
+        let x = self
+            .embedding_token
+            .forward(pairs.clone().slice([0..dims[0], 0..1]));
+        let y = self
+            .embedding_token
+            .forward(pairs.slice([0..dims[0], 1..2]));
 
         // println!("X: {}", x);
 
@@ -70,7 +74,8 @@ pub fn poincare_distance<B: Backend>(x: Tensor<B, 3>, y: Tensor<B, 3>) -> Tensor
 
     let num = diff * 2.0;
     let one = Tensor::<B, 2>::ones([1, 1], &device); // Create a tensor with value 1.0
-    let denom = (one.clone() - x_norm.clone().powf_scalar(2.0)) * (one.clone() - y_norm.clone().powf_scalar(2.0));
+    let denom = (one.clone() - x_norm.clone().powf_scalar(2.0))
+        * (one.clone() - y_norm.clone().powf_scalar(2.0));
     let distance = num / denom;
 
     let result = acosh(distance);
@@ -100,18 +105,18 @@ fn acosh<B: Backend>(x: Tensor<B, 2>) -> Tensor<B, 2> {
 
     // Compute x^2
     let x_squared = x.clone().powf_scalar(2.0);
-    
+
     // Compute the inside of the square root: x^2 - 1
     let inside_sqrt = x_squared.clone() - Tensor::<B, 2>::ones_like(&x_squared);
-    
+
     // Compute the square root
     let sqrt_term = inside_sqrt.sqrt();
-    
+
     // Compute x + sqrt(x^2 - 1)
     let add_term = x + sqrt_term;
-    
+
     // Compute ln(x + sqrt(x^2 - 1))
     let acosh_result = add_term.log();
-    
+
     acosh_result
 }
