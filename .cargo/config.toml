@@ -1,0 +1,16 @@
+[build]
+rustc-wrapper = "C:\\Users\\Joey\\scoop\\shims\\sccache.exe"
+
+# for Linux
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"] # switch to mold?
+
+# for Windows
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
+rustflags = [
+  # Nightly
+  # "-Zshare-generics=y",
+  "-Zthreads=0",
+]

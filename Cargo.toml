@@ -1,0 +1,17 @@
+[package]
+name = "taxotangolib"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "taxotango"
+path = "src/bin/taxotango.rs"
+
+[dependencies]
+burn = { version = "0.13.2", features = ["wgpu", "train"] }
+log = "0.4.22"
+env_logger = "0.11.5"
+petgraph = { version = "0.6.5", features = ["rayon"] }
+rand = "0.8.5"
+rand_xoshiro = "0.6.0"
+rayon = "1.10.0"
