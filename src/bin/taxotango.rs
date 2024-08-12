@@ -1,3 +1,4 @@
+use burn::optim::AdamConfig;
 use taxotangolib::*;
 
 use burn::backend::{wgpu::AutoGraphicsApi, Autodiff, Wgpu};
@@ -9,29 +10,42 @@ fn main() {
     let nodes_file = "/mnt/data/data/nt/taxdmp/nodes.dmp";
     let names_file = "/mnt/data/data/nt/taxdmp/names.dmp";
 
-    let mut batch_gen = build_taxonomy_graph(nodes_file, names_file);
+    build_taxonomy_graph_limit_depth(nodes_file, names_file, 2);
 
     // log::debug!("Generating first test batch");
 
     // let batch = batch_gen.generate_batch();
     // println!("{:?}", batch);
 
-    let config = PoincareTaxonomyEmbeddingModelConfig {
+    /* let config = PoincareTaxonomyEmbeddingModelConfig {
         taxonomy_size: batch_gen.nodes.len(),
         embedding_size: 16,
-    };
+    }; */
 
     type MyBackend = Wgpu<AutoGraphicsApi, f32, i32>;
+    type MyAutodiffBackend = Autodiff<MyBackend>;
+
     let device = burn::backend::wgpu::WgpuDevice::default();
 
-    let nn: PoincareTaxonomyEmbeddingModel<Wgpu> = config.init(&device);
+    println!("{:#?}", device);
 
-    let output = nn.forward(Tensor::<MyBackend, 2, Int>::from_data(
-        [[1, 2], [3, 4], [1, 6]],
-        &device,
-    ));
+    // let nn: PoincareTaxonomyEmbeddingModel<Wgpu> = config.init(&device);
 
-    println!("{}", output);
+    // let output = nn.forward(Tensor::<MyBackend, 2, Int>::from_data(
+    // [[1, 2], [3, 4], [1, 6]],
+    // &device,
+    // ));
+
+    // println!("{}", output);
+
+    /*
+
+    crate::model::train::<MyAutodiffBackend>(
+        "/tmp/guide",
+        crate::model::TrainingConfig::new(config, AdamConfig::new()),
+        batch_gen,
+        device,
+    ); */
 
     // let device = Default::default();
     // Creation of two tensors, the first with explicit values and the second one with ones, with the same shape as the first
