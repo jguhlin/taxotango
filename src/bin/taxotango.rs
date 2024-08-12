@@ -1,8 +1,11 @@
-use burn::optim::AdamConfig;
-use taxotangolib::*;
+// use mimalloc::MiMalloc;
+
+// #[global_allocator]
+// static GLOBAL: MiMalloc = MiMalloc;
 
 use burn::backend::{wgpu::AutoGraphicsApi, Autodiff, Wgpu};
-use burn::prelude::*;
+
+use taxotangolib::*;
 
 fn main() {
     env_logger::init();
@@ -10,7 +13,7 @@ fn main() {
     let nodes_file = "/mnt/data/data/nt/taxdmp/nodes.dmp";
     let names_file = "/mnt/data/data/nt/taxdmp/names.dmp";
 
-    build_taxonomy_graph_limit_depth(nodes_file, names_file, 2);
+    build_taxonomy_graph_limit_depth_csv_output(nodes_file, names_file, 4);
 
     // log::debug!("Generating first test batch");
 

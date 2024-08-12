@@ -18,3 +18,13 @@ rayon = "1.10.0"
 serde = { version = "1.0.206", features = ["derive"] }
 indicatif = "0.17.8"
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
+mimalloc = "0.1.43"
+zstd = { version = "0.13.2", features = ["zstdmt"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+debug = false
+panic = "abort"
+overflow-checks = true

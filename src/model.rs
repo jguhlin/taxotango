@@ -1,12 +1,19 @@
-use serde::{Deserialize, Serialize};
 use burn::{
-    backend::Wgpu, data::dataloader::{batcher::Batcher, DataLoaderBuilder}, nn::{Embedding, EmbeddingConfig, Linear, LinearConfig}, optim::AdamConfig, prelude::*, record::CompactRecorder,tensor::{activation::softmax, backend::AutodiffBackend}, train::{
+    backend::Wgpu,
+    data::dataloader::{batcher::Batcher, DataLoaderBuilder},
+    nn::{Embedding, EmbeddingConfig, Linear, LinearConfig},
+    optim::AdamConfig,
+    prelude::*,
+    record::CompactRecorder,
+    tensor::{activation::softmax, backend::AutodiffBackend},
+    train::{
         metric::{AccuracyMetric, LossMetric},
         ClassificationOutput, LearnerBuilder, RegressionOutput, TrainOutput, TrainStep, ValidStep,
-    }
+    },
 };
+use serde::{Deserialize, Serialize};
 
-use crate::build_taxonomy_graph;
+use crate::build_taxonomy_graph_gen;
 
 // Define the model configuration
 #[derive(Config)]
