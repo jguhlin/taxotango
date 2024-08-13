@@ -1,41 +1,55 @@
+use burn::backend::autodiff::grads::Gradients;
 use burn::{
-    backend::Wgpu,
     data::dataloader::{batcher::Batcher, DataLoaderBuilder},
-    nn::{Embedding, EmbeddingConfig, Linear, LinearConfig},
-    optim::AdamConfig,
+    module::AutodiffModule,
+    nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig},
+    optim::{AdamConfig, GradientsParams, Optimizer},
     prelude::*,
     record::CompactRecorder,
-    tensor::{activation::softmax, backend::AutodiffBackend},
+    tensor::backend::AutodiffBackend,
     train::{
-        metric::{AccuracyMetric, LossMetric},
-        ClassificationOutput, LearnerBuilder, RegressionOutput, TrainOutput, TrainStep, ValidStep,
+        metric::{CpuTemperature, LossMetric},
+        LearnerBuilder, RegressionOutput, TrainOutput, TrainStep, ValidStep,
     },
 };
 use serde::{Deserialize, Serialize};
-
-use crate::build_taxonomy_graph_gen;
 
 // Define the model configuration
 #[derive(Config)]
 pub struct PoincareTaxonomyEmbeddingModelConfig {
     pub taxonomy_size: usize,
     pub embedding_size: usize,
+    // pub layer_norm_eps: f64,
 }
 
 // Define the model structure
 #[derive(Module, Debug)]
 pub struct PoincareTaxonomyEmbeddingModel<B: Backend> {
     embedding_token: Embedding<B>,
+    // layer_norm: LayerNorm<B>,
 }
 
 // Define functions for model initialization
 impl PoincareTaxonomyEmbeddingModelConfig {
     /// Initializes a model with default weights
     pub fn init<B: Backend>(&self, device: &B::Device) -> PoincareTaxonomyEmbeddingModel<B> {
-        let embedding_token =
-            EmbeddingConfig::new(self.taxonomy_size, self.embedding_size).init(device);
+        let initializer = burn::nn::Initializer::Uniform {
+            min: 1e-10,
+            max: 1e-4,
+        };
 
-        PoincareTaxonomyEmbeddingModel { embedding_token }
+        //let layer_norm = LayerNormConfig::new(self.embedding_size)
+            //.with_epsilon(self.layer_norm_eps)
+            //.init(device);
+
+        let embedding_token = EmbeddingConfig::new(self.taxonomy_size, self.embedding_size)
+            .with_initializer(initializer)
+            .init(device);
+
+        PoincareTaxonomyEmbeddingModel {
+            embedding_token,
+            // layer_norm,
+        }
     }
 }
 
@@ -43,9 +57,8 @@ impl<B: Backend> PoincareTaxonomyEmbeddingModel<B> {
     // Defines forward pass for training
     pub fn forward(&self, pairs: Tensor<B, 2, Int>) -> Tensor<B, 2, Float> {
         let dims = pairs.dims();
-        // println!("{:?}", dims);
-        // println!("{}", pairs);
-        // println!("Pairs sliced: {}", pairs.clone().slice([0..dims[0], 0..1]));
+
+        /*
 
         // Calculate the Poincaré distance
         let x = self
@@ -55,17 +68,28 @@ impl<B: Backend> PoincareTaxonomyEmbeddingModel<B> {
             .embedding_token
             .forward(pairs.slice([0..dims[0], 1..2]));
 
-        // println!("X: {}", x);
-
-        // let dims = x.dims();
-        // println!("Embedding Dims: {:?}", dims);
-
-        // let x = x.squeeze(0);
-        // let y = y.squeeze(0);
-
-        // println!("Getting distance");
+        // let y = self.layer_norm.forward(y);
+        // let x = self.layer_norm.forward(x);
 
         poincare_distance(x, y)
+        */
+
+        // Simple euclidian
+        let x = self
+            .embedding_token
+            .forward(pairs.clone().slice([0..pairs.dims()[0], 0..1]));
+
+        let y = self
+            .embedding_token
+            .forward(pairs.clone().slice([0..pairs.dims()[0], 1..2]));
+
+        // let x = self.layer_norm.forward(x);
+        // let y = self.layer_norm.forward(y);
+        // let x = x.add_scalar(1e-8);
+        // let y = y.add_scalar(1e-8);
+
+        let distance = (x - y).powf_scalar(2.0).sum_dim(2).sqrt();
+        distance.squeeze(1)
     }
 
     pub fn forward_regression(
@@ -74,11 +98,21 @@ impl<B: Backend> PoincareTaxonomyEmbeddingModel<B> {
         distances: Tensor<B, 2, Float>,
     ) -> RegressionOutput<B> {
         let predicted_distances = self.forward(pairs);
+
+        //if predicted_distances.clone().to_data().convert::<f32>().value.iter().any(|x| x.is_nan()) {
+        //println!("NaN detected in distances");
+        //}
+
+        //if predicted_distances.clone().to_data().convert::<f32>().value.iter().any(|x| x.is_infinite()) {
+        //println!("Infinity detected in distances");
+        //}
+
         let loss = (predicted_distances.clone() - distances.clone())
             .powf_scalar(2.0)
             .mean();
 
-        RegressionOutput::new(loss, predicted_distances, distances)
+        let output = RegressionOutput::new(loss, predicted_distances, distances);
+        output
     }
 }
 
@@ -139,6 +173,26 @@ impl<B: AutodiffBackend> TrainStep<TangoBatch<B>, RegressionOutput<B>>
 
         TrainOutput::new(self, item.loss.backward(), item)
     }
+
+    fn optimize<AB, O>(self, optim: &mut O, lr: f64, grads: GradientsParams) -> Self
+    where
+        AB: AutodiffBackend,
+        O: Optimizer<Self, AB>,
+        Self: AutodiffModule<AB>,
+    {
+        /*
+        self.embedding_token.weight = self.embedding_token.weight.map(|x|
+            x.clamp(0.0, 1.0)
+        );
+        */
+
+        // todo move to after optimize step
+        // self.embedding_token.clone().weight.map(|x| {
+            //normalize_to_poincare_ball(x)
+        //});
+
+        optim.step(lr, self, grads)
+    }
 }
 
 impl<B: Backend> ValidStep<TangoBatch<B>, RegressionOutput<B>>
@@ -150,64 +204,47 @@ impl<B: Backend> ValidStep<TangoBatch<B>, RegressionOutput<B>>
 }
 
 pub fn poincare_distance<B: Backend>(x: Tensor<B, 3>, y: Tensor<B, 3>) -> Tensor<B, 2> {
-    let device = x.device();
+    // let device = x.device();
 
-    let x_norm = l2_norm(x.clone()).clamp(0.0, 1.0 - 1e-5);
-    let y_norm = l2_norm(y.clone()).clamp(0.0, 1.0 - 1e-5);
+    let x_norm = l2_norm(x.clone()); //.clamp(1e-5, 1.0 - 1e-5);
+    let y_norm = l2_norm(y.clone()); // .clamp(1e-5, 1.0 - 1e-5);
 
     let diff = x - y;
-    // println!("Diff: {}", diff);
-    // let diff = diff.powf(Tensor::<B, 3>::from_floats([[[2.0]]], &device));
-    let diff = l2_norm(diff.clone());
-    let diff = diff.powf_scalar(2.0);
+    let diff_norm = l2_norm(diff).powf_scalar(2.0);
 
-    let num = diff * 2.0;
-    let one = Tensor::<B, 2>::ones([1, 1], &device); // Create a tensor with value 1.0
-    let denom = (one.clone() - x_norm.clone().powf_scalar(2.0))
-        * (one.clone() - y_norm.clone().powf_scalar(2.0));
+    let num = diff_norm * 2.0;
+    // let num = num.add_scalar(1e-8);
+    let one = Tensor::<B, 2>::ones_like(&x_norm);
+    let denom =
+        (one.clone() - x_norm.clone().powf_scalar(2.0)) * (one - y_norm.clone().powf_scalar(2.0));
+    // let denom = denom.add_scalar(1e-8);
+
     let distance = num / denom;
 
-    let result = acosh(distance);
+    // 1 + relu distance
+    // let ones_like = Tensor::<B, 2>::ones_like(&distance);
+    // let distance = ones_like + burn::tensor::activation::relu(distance);
 
-    result
+    acosh(distance)
 }
 
-/// Calculate the L2 norm of a tensor
-///
-/// # Arguments
-/// * `x` - A tensor of shape [batch_size, embedding_size]
-///
-/// # Returns
-/// A tensor of shape [batch_size] containing the L2 norm of each row in `x`
-///
 pub fn l2_norm<B: Backend>(x: Tensor<B, 3>) -> Tensor<B, 2> {
-    // let device = x.device();
-    let data = x.powf_scalar(2.0).sum_dim(2).sqrt();
-    // let dims = data.dims();
-    // println!("L2 Norm Dims: {:?}", dims);
-    // println!("L2 Norm Data: {}", data);
-    data.squeeze(1)
+    x.powf_scalar(2.0).sum_dim(2).sqrt().squeeze(2)
 }
 
 fn acosh<B: Backend>(x: Tensor<B, 2>) -> Tensor<B, 2> {
-    // let device = x.device();
-
-    // Compute x^2
+    // let x = x.clamp_min(1.000005);
+    assert!(
+        x.clone()
+            .greater_equal(Tensor::<B, 2>::ones_like(&x))
+            .all()
+            .into_scalar(),
+        "acosh(x) input must be >= 1"
+    );
     let x_squared = x.clone().powf_scalar(2.0);
-
-    // Compute the inside of the square root: x^2 - 1
-    let inside_sqrt = x_squared.clone() - Tensor::<B, 2>::ones_like(&x_squared);
-
-    // Compute the square root
+    let inside_sqrt = x_squared.sub_scalar(1.0);
     let sqrt_term = inside_sqrt.sqrt();
-
-    // Compute x + sqrt(x^2 - 1)
-    let add_term = x + sqrt_term;
-
-    // Compute ln(x + sqrt(x^2 - 1))
-    let acosh_result = add_term.log();
-
-    acosh_result
+    (x + sqrt_term).log()
 }
 
 // Training stuff
@@ -215,15 +252,15 @@ fn acosh<B: Backend>(x: Tensor<B, 2>) -> Tensor<B, 2> {
 pub struct TrainingConfig {
     pub model: PoincareTaxonomyEmbeddingModelConfig,
     pub optimizer: AdamConfig,
-    #[config(default = 10)]
+    #[config(default = 1024)]
     pub num_epochs: usize,
-    #[config(default = 64)]
+    #[config(default = 16)]
     pub batch_size: usize,
-    #[config(default = 4)]
+    #[config(default = 2)]
     pub num_workers: usize,
     #[config(default = 1337)]
     pub seed: u64,
-    #[config(default = 1.0e-5)]
+    #[config(default = 1.0e-6)]
     pub learning_rate: f64,
 }
 
@@ -285,4 +322,40 @@ pub fn train<B: AutodiffBackend>(
     model_trained
         .save_file(format!("{artifact_dir}/model"), &CompactRecorder::new())
         .expect("Trained model should be saved successfully");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn_wgpu::{AutoGraphicsApi, Wgpu, OpenGl};
+    use burn::backend::autodiff::Autodiff;
+    use burn::tensor::Tensor;
+
+    #[test]
+    fn test_poincare_distance() {
+        type MyBackend = Wgpu<AutoGraphicsApi, f32, i32>;
+        let device = burn_wgpu::WgpuDevice::default();
+
+        let x = Tensor::<MyBackend, 3, Float>::from_data(
+            [[[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]],
+            &device,
+        );
+        let y = Tensor::<MyBackend, 3, Float>::from_data(
+            [[[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]]],
+            &device,
+        );
+
+        let distance = poincare_distance(x, y);
+
+        let expected =
+            Tensor::<MyBackend, 2, Float>::from_data([[1.31696], [1.31696], [1.31696]], &device);
+
+        println!("{}", distance);
+        println!("{}", expected);
+
+        let equals = distance.equal(expected).all();
+        let equals = equals.into_data().value[0];
+
+        assert!(equals);
+    }
 }
