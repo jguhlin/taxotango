@@ -34,17 +34,32 @@ fn main() {
     let device = burn::backend::wgpu::WgpuDevice::default();
 
     let model = config.init::<MyBackend>(&device);
-    // Test data
-    // todo
+    let batch = TaxaDistance {
+        origin: 1,
+        branches: [1, 2, 3, 4, 5, 6, 7, 8],
+        distances: [1, 2, 3, 4, 5, 6, 7, 8],
+    };
+
+    let origin = TensorData::new(vec![batch.origin], [1, 1]);
+    let branches = TensorData::new(batch.branches.to_vec(), [1, 8]);
+
+    let origin = Tensor::from(origin);
+    let branches = Tensor::from(branches);
+
+    let output = model.forward(origin, branches);
+    println!("{:#?}", output);
+    println!("{}", output);
+
 
     let adamconfig = AdamConfig::new()
         .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(1.0)));
 
+    /*
     crate::model::train::<MyAutodiffBackend>(
         "/mnt/data/data/taxontango_training",
         crate::model::TrainingConfig::new(config, adamconfig),
         generator,
         device,
-    );
+    ); */
 
 }

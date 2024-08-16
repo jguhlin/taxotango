@@ -34,8 +34,8 @@ impl PoincareTaxonomyEmbeddingModelConfig {
     /// Initializes a model with default weights
     pub fn init<B: Backend>(&self, device: &B::Device) -> PoincareTaxonomyEmbeddingModel<B> {
         let initializer = burn::nn::Initializer::Uniform {
-            min: 1e-10,
-            max: 1e-4,
+            min: 1e-8,
+            max: 1e-3,
         };
 
         //let layer_norm = LayerNormConfig::new(self.embedding_size)
@@ -113,11 +113,11 @@ impl<B: Backend> PoincareTaxonomyEmbeddingModel<B> {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TaxaDistance {
+#[derive(Clone, Debug)]
+pub struct TaxaDistance<const N: usize> {
     pub origin: u32,
-    pub branches: [u32; 2],
-    pub distances: [u32; 2],
+    pub branches: [u32; N],
+    pub distances: [u32; N],
 }
 
 #[derive(Clone)]
@@ -138,8 +138,8 @@ pub struct TangoBatch<B: Backend> {
     pub distances: Tensor<B, 2, Float>,
 }
 
-impl<B: Backend> Batcher<TaxaDistance, TangoBatch<B>> for TangoBatcher<B> {
-    fn batch(&self, items: Vec<TaxaDistance>) -> TangoBatch<B> {
+impl<B: Backend, const N: usize> Batcher<TaxaDistance<N>, TangoBatch<B>> for TangoBatcher<B> {
+    fn batch(&self, items: Vec<TaxaDistance<N>>) -> TangoBatch<B> {
 
         let origins = items
             .iter()
@@ -337,7 +337,6 @@ mod tests {
 
         let equals = distance.equal(expected).all();
         // let equals = equals.into_data().value[0];
-
 
         //assert!(equals);
     }

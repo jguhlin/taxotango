@@ -155,12 +155,6 @@ pub fn build_taxonomy_graph_generator(nodes_file: &str, names_file: &str) -> Bat
         graph.edge_count()
     );
 
-    // Store everything into sql database
-    let storage =
-        SqliteDatasetStorage::from_name("TaxonomyDB").with_base_dir("/mnt/data/data/taxonomy.db");
-
-    let mut writer = storage.writer::<TaxaDistance>(true).unwrap();
-
     let mut count = 0;
 
     let mut idx = 0;
@@ -182,13 +176,13 @@ pub struct BatchGenerator {
     pub levels: HashMap<u32, TaxaLevel>,
 }
 
-impl Dataset<TaxaDistance> for BatchGenerator {
+impl Dataset<TaxaDistance<2>> for BatchGenerator {
     fn len(&self) -> usize {
         // Batch size of 1024
         self.epoch_size
     }
 
-    fn get(&self, _index: usize) -> Option<TaxaDistance> {
+    fn get(&self, _index: usize) -> Option<TaxaDistance<2>> {
         let mut rng = thread_rng();
 
         let len = self.graph.node_count();
@@ -229,7 +223,7 @@ impl Dataset<TaxaDistance> for BatchGenerator {
         self.graph.node_count() == 0
     }
 
-    fn iter(&self) -> DatasetIterator<'_, TaxaDistance>
+    fn iter(&self) -> DatasetIterator<'_, TaxaDistance<2>>
     where
         Self: Sized,
     {
