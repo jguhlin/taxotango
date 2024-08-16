@@ -8,7 +8,8 @@ name = "taxotango"
 path = "src/bin/taxotango.rs"
 
 [dependencies]
-burn = { version = "0.13.2", features = ["train"] }
+# burn = { version = "0.13.2", features = ["train"] }
+burn = { git = "https://github.com/tracel-ai/burn", features = ["train", "wgpu"]}
 log = "0.4.22"
 env_logger = "0.11.5"
 petgraph = { version = "0.6.5", features = ["rayon"] }
@@ -20,7 +21,8 @@ indicatif = "0.17.8"
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 mimalloc = "0.1.43"
 zstd = { version = "0.13.2", features = ["zstdmt"] }
-burn-wgpu = { version = "0.13.2", features = ["std"], no-default-features = true }
+flexi_logger = "0.28.5"
+# burn-wgpu = { git = "https://github.com/tracel-ai/burn/tree/main/crates/burn-wgpu", features = ["std"], no-default-features = true }
 
 [profile.release]
 # lto = true

@@ -106,667 +106,6 @@ impl TaxaLevel {
     }
 }
 
-pub fn build_taxonomy_graph_limit_depth_csv_output(nodes_file: &str, names_file: &str, depth: u8) {
-    // acc2tax todo: change it so we are passing &str
-    let names = parse_names(names_file.to_string());
-    let nodes = parse_nodes(nodes_file.to_string());
-
-    log::info!("Parsed names: {} total", names.0.len());
-    log::debug!("Parsed names (first 10): {:?}", &names.0[0..10]);
-    log::debug!("Parsed names (u32, first 10): {:?}", &names.1[0..10]);
-    log::info!("Parsed nodes: {} total", nodes.0.len());
-    log::debug!("Parsed nodes (first 10): {:?}", &nodes.0[0..10]);
-    log::debug!("Parsed nodes (Strings, first 10): {:?}", &nodes.1[0..10]);
-
-    // Put names into a hashmap
-    let _names = names
-        .0
-        .iter()
-        .enumerate()
-        .map(|(idx, name)| (idx as u32, name.clone()))
-        .collect::<HashMap<u32, String>>();
-
-    // When a parent is 0 it means drop it, 1 is the root
-    let edges: Vec<(u32, u32)> = nodes.0;
-    println!("Length: {}", edges.len());
-    let edges = edges
-        .into_iter()
-        .filter(|(x, y)| *x != 0 && *y != 0)
-        .collect::<Vec<(u32, u32)>>();
-    println!("Length: {}", edges.len());
-
-    let _levels: HashMap<u32, TaxaLevel> = nodes
-        .1
-        .iter()
-        .enumerate()
-        .map(|(idx, rank)| (idx as u32, TaxaLevel::from_str(rank)))
-        .collect();
-
-    // Filter for distinct, pull from both x and y
-    let nodes: Vec<u32> = edges.iter().flat_map(|(x, y)| [x, y]).copied().collect();
-    let nodes = nodes.into_iter().collect::<HashSet<u32>>();
-    let nodes = nodes.into_iter().collect::<Vec<u32>>();
-
-    assert!(nodes.len() <= u32::MAX as usize);
-
-    // Dev, limit to first 1000 nodes
-    // let nodes = nodes.iter().take(1000).copied().collect::<Vec<u32>>();
-
-    log::debug!("Total Edges: {}", edges.len());
-
-    log::info!("Building taxonomy graph");
-    // let mut graph = UnGraph::<u32, (), u32>::from_edges(&edges);
-    // let graph = MatrixGraph::<u32, (), Undirected, Option<()>, u32>::from_edges(&edges);
-
-    let mut graph = UnGraph::<u32, (), u32>::with_capacity(nodes.len(), nodes.len());
-
-    let nodes: HashMap<u32, NodeIndex> = nodes.iter().map(|x| (*x, graph.add_node(*x))).collect();
-
-    for (x, y) in edges {
-        graph.add_edge(nodes[&x], nodes[&y], ());
-    }
-
-    log::info!(
-        "Taxonomy graph built. Node Count: {} - Edge Count: {}",
-        graph.node_count(),
-        graph.edge_count()
-    );
-
-    // For all nodes, calculate all distances for a depth of _depth_
-    // for i in graph.node_indices() {
-
-    let (sender, receiver) = bounded::<TaxonomyWriterMessage>(8192);
-
-    let is_finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    let shutdown = std::sync::Arc::clone(&is_finished);
-    let graph2 = graph.clone();
-
-    let mut output_file =
-        File::create("/mnt/data/data/taxonomy.db/taxonomy.csv.zst").expect("Error creating file");
-    let mut output_file = BufWriter::with_capacity(8 * 1024, output_file);
-    let mut output_file =
-        zstd::stream::Encoder::new(output_file, 3).expect("Error creating zstd encoder");
-    output_file
-        .set_parameter(zstd::stream::raw::CParameter::NbWorkers(2))
-        .expect("Error setting compression level");
-
-    let csv_writer_join_handle = std::thread::spawn(move || {
-        let mut rng = Xoshiro256PlusPlus::seed_from_u64(1337);
-        let graph = graph2;
-
-        let mut total_items: usize = 0;
-
-        let total_size = graph.node_count();
-        let pb = ProgressBar::new(total_size as u64);
-        pb.set_style(
-            ProgressStyle::with_template(
-                "[{elapsed}] {bar:40.cyan/blue} {pos:>7}/{len:7} {eta} {msg}",
-            )
-            .unwrap(),
-        );
-
-        let mut max_depth = 0;
-        let mut max_connections = 0;
-
-        while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            match receiver.recv() {
-                Ok(TaxonomyWriterMessage::Write(queue)) => {
-                    if queue.len() > max_connections {
-                        max_connections = queue.len();
-                    }
-
-                    pb.inc(1);
-                    pb.set_message(format!("Total: {} / Current Queue: {} / Max Depth: {} / Channel Len: {} / Max Connections: {}", total_items, queue.len(), max_depth, receiver.len(), max_connections));
-
-                    queue
-                        .into_iter()
-                        .map(|(x, y, z)| {
-                            if max_depth < z {
-                                max_depth = z;
-                            }
-
-                            if x == y {
-                                return None;
-                            }
-
-                            // If depth > 1, randomly keep
-                            if z > 1 && rng.gen_bool(0.4 / z as f64) {
-                                return None;
-                            }
-
-                            let bin = match rng.gen_bool(0.0005) {
-                                true => "Test",
-                                false => "Train",
-                            };
-
-                            total_items += 1;
-
-                            // writeln!(output_file, "{},{},{},{}", graph[x], graph[y], z, bin).expect("Error writing to file");
-                            Some(format!("{},{},{},{}\n", graph[x], graph[y], z, bin))
-                        })
-                        .filter_map(|x| x)
-                        .for_each(|x| {
-                            output_file
-                                .write_all(x.as_bytes())
-                                .expect("Error writing to file");
-                        });
-
-                    /*
-
-                    for (x, y, z) in queue {
-                        if max_depth < z {
-                          max_depth = z;
-                        }
-
-                        // If depth > 1, randomly keep
-                        if z > 1 && rng.gen_bool(1.0 / z as f64) {
-                            continue;
-                        }
-
-                        let bin = match rng.gen_bool(0.0005) {
-                            true => "Test",
-                            false => "Train",
-                        };
-
-                        writeln!(output_file, "{},{},{},{}", graph[x], graph[y], z, bin).expect("Error writing to file");
-
-                        total_items += 1;
-                    } */
-                }
-                Ok(TaxonomyWriterMessage::Completed) => {
-                    // pb.inc(1);
-                    // deprecated
-                }
-                Err(_) => {}
-            }
-        }
-        pb.finish_with_message(format!(
-            "Finished writing to database. Total items: {}",
-            total_items
-        ));
-    });
-
-    for i in graph.node_indices() {
-        if is_finished.load(std::sync::atomic::Ordering::Relaxed) {
-            return;
-        }
-
-        let mut cur_depth = 0;
-
-        let mut queue = vec![(i, cur_depth)];
-        let neighbors = graph.neighbors(i.into()).collect::<Vec<_>>();
-        let mut used = HashSet::new();
-
-        neighbors.into_iter().for_each(|x| {
-            if !used.contains(&x) {
-                used.insert(x);
-                queue.push((x, cur_depth + 1));
-            }
-        });
-
-        cur_depth += 1;
-
-        let mut working_queue: Vec<(NodeIndex, u8)> = queue.clone();
-        let mut new_queue = Vec::new();
-
-        while cur_depth < depth {
-            for (node_idx, node_depth) in working_queue.iter() {
-                // Only on nodes at the current depth do we extract more neighbors
-                let neighbors = graph.neighbors((*node_idx).into()).collect::<Vec<_>>();
-                neighbors.into_iter().for_each(|x| {
-                    if !used.contains(&x) {
-                        used.insert(x);
-                        new_queue.push((x, cur_depth + 1));
-                    }
-                });
-            }
-
-            working_queue = new_queue.clone();
-            queue.extend(new_queue.clone());
-            new_queue.clear();
-            cur_depth += 1;
-        }
-
-        let queue: Vec<(NodeIndex, NodeIndex, u8)> =
-            queue.iter().map(|(x, y)| (i, *x, *y)).collect();
-
-        /*
-        if queue.len() >= 1000 {
-            // Print name of query node
-            let name = names.get(&graph[i]).unwrap();
-            println!(
-                "Query Taxaid: {} {:?} {} - Query Node: {} - Queue Size: {} - Max Depth: {}",
-                graph[i],
-                i,
-                i.index(),
-                name,
-                queue.len(),
-                queue.iter().map(|x| x.2).max().unwrap()
-            );
-        } */
-
-        let mut result = sender.try_send(TaxonomyWriterMessage::Write(queue));
-
-        while let Err(msg) = result {
-            match msg {
-                crossbeam::channel::TrySendError::Full(msg) => {
-                    std::thread::sleep(std::time::Duration::from_millis(270));
-                    result = sender.try_send(msg);
-                }
-                crossbeam::channel::TrySendError::Disconnected(_) => {
-                    is_finished.store(true, std::sync::atomic::Ordering::Relaxed);
-                    return;
-                }
-            }
-        }
-
-        graph.remove_node(i).expect("Error removing node");
-    }
-
-    /*
-    let node_indices = graph.node_indices().collect::<Vec<_>>();
-    let indices: Vec<usize> = (0..node_indices.len()).collect::<Vec<_>>();
-
-    indices.par_iter().for_each(|i| {
-        if is_finished.load(std::sync::atomic::Ordering::Relaxed) {
-            return;
-        }
-
-        let i = node_indices[*i];
-        let mut cur_depth = 0;
-
-        let mut queue = vec![(i, cur_depth)];
-        let mut used = HashSet::new();
-        let neighbors = graph.neighbors(i.into()).collect::<Vec<_>>();
-        neighbors.into_iter().for_each(|x| {
-            if !used.contains(&x) {
-                used.insert(x);
-                queue.push((x, cur_depth + 1));
-            }
-        });
-
-        cur_depth += 1;
-
-        let mut working_queue: Vec<(NodeIndex, u8)> = queue.clone();
-        let mut new_queue = Vec::new();
-
-        while cur_depth < depth {
-
-            for (node_idx, node_depth) in working_queue.iter() {
-                // Depth we are working on
-                if *node_depth < cur_depth {
-                    continue
-                }
-
-                // Only on nodes at the current depth do we extract more neighbors
-                let neighbors = graph.neighbors((*node_idx).into()).collect::<Vec<_>>();
-                neighbors.into_iter().for_each(|x| {
-                    if !used.contains(&x) {
-                        used.insert(x);
-                        new_queue.push((x, cur_depth + 1));
-                    }
-                });
-            }
-
-            working_queue = new_queue.clone();
-            queue.extend(new_queue.clone());
-            new_queue.clear();
-            cur_depth += 1;
-        }
-
-        let queue: Vec<(NodeIndex, NodeIndex, u8)> = queue
-            .iter()
-            .map(|(x, y)| (i, *x, *y))
-            .collect();
-
-        let mut result = sender.try_send(TaxonomyWriterMessage::Write(queue));
-
-        while let Err(msg) = result {
-            match msg {
-                crossbeam::channel::TrySendError::Full(msg) => {
-                    std::thread::sleep(std::time::Duration::from_millis(270));
-                    result = sender.try_send(msg);
-                },
-                crossbeam::channel::TrySendError::Disconnected(_) => {
-                    is_finished.store(true, std::sync::atomic::Ordering::Relaxed);
-                    return;
-                }
-            }
-
-        }
-    });
-    */
-
-    is_finished.store(true, std::sync::atomic::Ordering::Relaxed);
-
-    csv_writer_join_handle.join().unwrap();
-
-    log::info!("Finished writing to database");
-}
-
-pub fn build_taxonomy_graph_limit_depth(nodes_file: &str, names_file: &str, depth: u8) {
-    // acc2tax todo: change it so we are passing &str
-    let names = parse_names(names_file.to_string());
-    let nodes = parse_nodes(nodes_file.to_string());
-
-    log::info!("Parsed names: {} total", names.0.len());
-    log::debug!("Parsed names (first 10): {:?}", &names.0[0..10]);
-    log::debug!("Parsed names (u32, first 10): {:?}", &names.1[0..10]);
-    log::info!("Parsed nodes: {} total", nodes.0.len());
-    log::debug!("Parsed nodes (first 10): {:?}", &nodes.0[0..10]);
-    log::debug!("Parsed nodes (Strings, first 10): {:?}", &nodes.1[0..10]);
-
-    // Put names into a hashmap
-    let names = names
-        .0
-        .iter()
-        .enumerate()
-        .map(|(idx, name)| (idx as u32, name.clone()))
-        .collect::<HashMap<u32, String>>();
-
-    // When a parent is 0 it means drop it, 1 is the root
-    let edges: Vec<(u32, u32)> = nodes.0;
-    println!("Length: {}", edges.len());
-    let edges = edges
-        .into_iter()
-        .filter(|(x, y)| *x != 0 && *y != 0)
-        .collect::<Vec<(u32, u32)>>();
-    println!("Length: {}", edges.len());
-
-    let levels: HashMap<u32, TaxaLevel> = nodes
-        .1
-        .iter()
-        .enumerate()
-        .map(|(idx, rank)| (idx as u32, TaxaLevel::from_str(rank)))
-        .collect();
-
-    // Filter for distinct, pull from both x and y
-    let nodes: Vec<u32> = edges.iter().flat_map(|(x, y)| [x, y]).copied().collect();
-    let nodes = nodes.into_iter().collect::<HashSet<u32>>();
-    let nodes = nodes.into_iter().collect::<Vec<u32>>();
-
-    assert!(nodes.len() <= u32::MAX as usize);
-
-    // Dev, limit to first 1000 nodes
-    // let nodes = nodes.iter().take(1000).copied().collect::<Vec<u32>>();
-
-    log::debug!("Total Edges: {}", edges.len());
-
-    log::info!("Building taxonomy graph");
-    // let mut graph = UnGraph::<u32, (), u32>::from_edges(&edges);
-    // let graph = MatrixGraph::<u32, (), Undirected, Option<()>, u32>::from_edges(&edges);
-
-    let mut graph = UnGraph::<u32, (), u32>::with_capacity(nodes.len(), nodes.len());
-
-    let nodes: HashMap<u32, NodeIndex> = nodes.iter().map(|x| (*x, graph.add_node(*x))).collect();
-
-    for (x, y) in edges {
-        graph.add_edge(nodes[&x], nodes[&y], ());
-    }
-
-    log::info!(
-        "Taxonomy graph built. Node Count: {} - Edge Count: {}",
-        graph.node_count(),
-        graph.edge_count()
-    );
-
-    // Store everything into sql database
-    let storage =
-        SqliteDatasetStorage::from_name("TaxonomyDB").with_base_dir("/mnt/data/data/taxonomy.db");
-
-    let mut writer = storage.writer::<TaxaDistance>(true).unwrap();
-
-    // For all nodes, calculate all distances for a depth of _depth_
-    // for i in graph.node_indices() {
-
-    let (sender, receiver) = bounded::<TaxonomyWriterMessage>(8192);
-
-    let is_finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    let shutdown = std::sync::Arc::clone(&is_finished);
-    let graph2 = graph.clone();
-
-    let db_writer_join_handle = std::thread::spawn(move || {
-        // let mut already_inserted = HashSet::with_capacity(nodes.len() * 10);
-        let mut rng = Xoshiro256PlusPlus::seed_from_u64(1337);
-        let graph = graph2;
-
-        let mut total_items = 0;
-
-        let total_size = graph.node_count();
-        let pb = ProgressBar::new(total_size as u64);
-        pb.set_style(
-            ProgressStyle::with_template(
-                "[{elapsed}] {bar:40.cyan/blue} {pos:>7}/{len:7} {eta} {msg}",
-            )
-            .unwrap(),
-        );
-
-        let mut max_depth = 0;
-        let mut max_connections = 0;
-
-        while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            match receiver.recv() {
-                Ok(TaxonomyWriterMessage::Write(queue)) => {
-                    if queue.len() > max_connections {
-                        max_connections = queue.len();
-                    }
-
-                    pb.inc(1);
-                    pb.set_message(format!("Total: {} / Current Queue: {} / Max Depth: {} / Channel Len: {} / Max Connections: {}", total_items, queue.len(), max_depth, receiver.len(), max_connections));
-
-                    for (x, y, z) in queue {
-                        if max_depth < z {
-                            max_depth = z;
-                        }
-
-                        // If depth > 1, randomly keep
-                        if z > 1 && rng.gen_bool(1.0 / z as f64) {
-                            continue;
-                        }
-
-                        // If already inserted, skip
-                        // Sort the keys
-                        //let mut key = [x.index(), y.index()];
-                        // key.sort_unstable();
-
-                        // if already_inserted.contains(&key) {
-                        //continue;
-                        //}
-
-                        // already_inserted.insert(key);
-
-                        let bin = match rng.gen_bool(0.0005) {
-                            true => "Test",
-                            false => "Train",
-                        };
-
-                        writer
-                            .write(
-                                bin,
-                                &TaxaDistance {
-                                    branches: [graph[x], graph[y]],
-                                    distance: z as f32,
-                                },
-                            )
-                            .expect("Error writing to database");
-
-                        total_items += 1;
-                    }
-                }
-                Ok(TaxonomyWriterMessage::Completed) => {
-                    // pb.inc(1);
-                    // deprecated
-                }
-                Err(_) => {}
-            }
-        }
-        writer.set_completed().expect("Error setting complete");
-        pb.finish_with_message(format!(
-            "Finished writing to database. Total items: {}",
-            total_items
-        ));
-    });
-
-    for i in graph.node_indices() {
-        if is_finished.load(std::sync::atomic::Ordering::Relaxed) {
-            return;
-        }
-
-        let mut cur_depth = 0;
-
-        let mut queue = vec![(i, cur_depth)];
-        let neighbors = graph.neighbors(i.into()).collect::<Vec<_>>();
-        let mut used = HashSet::new();
-
-        neighbors.into_iter().for_each(|x| {
-            if !used.contains(&x) {
-                used.insert(x);
-                queue.push((x, cur_depth + 1));
-            }
-        });
-
-        cur_depth += 1;
-
-        let mut working_queue: Vec<(NodeIndex, u8)> = queue.clone();
-        let mut new_queue = Vec::new();
-
-        while cur_depth < depth {
-            for (node_idx, node_depth) in working_queue.iter() {
-                // Only on nodes at the current depth do we extract more neighbors
-                let neighbors = graph.neighbors((*node_idx).into()).collect::<Vec<_>>();
-                neighbors.into_iter().for_each(|x| {
-                    if !used.contains(&x) {
-                        used.insert(x);
-                        new_queue.push((x, cur_depth + 1));
-                    }
-                });
-            }
-
-            working_queue = new_queue.clone();
-            queue.extend(new_queue.clone());
-            new_queue.clear();
-            cur_depth += 1;
-        }
-
-        let queue: Vec<(NodeIndex, NodeIndex, u8)> =
-            queue.iter().map(|(x, y)| (i, *x, *y)).collect();
-
-        /*
-        if queue.len() >= 1000 {
-            // Print name of query node
-            let name = names.get(&graph[i]).unwrap();
-            println!(
-                "Query Taxaid: {} {:?} {} - Query Node: {} - Queue Size: {} - Max Depth: {}",
-                graph[i],
-                i,
-                i.index(),
-                name,
-                queue.len(),
-                queue.iter().map(|x| x.2).max().unwrap()
-            );
-        } */
-
-        let mut result = sender.try_send(TaxonomyWriterMessage::Write(queue));
-
-        while let Err(msg) = result {
-            match msg {
-                crossbeam::channel::TrySendError::Full(msg) => {
-                    std::thread::sleep(std::time::Duration::from_millis(270));
-                    result = sender.try_send(msg);
-                }
-                crossbeam::channel::TrySendError::Disconnected(_) => {
-                    is_finished.store(true, std::sync::atomic::Ordering::Relaxed);
-                    return;
-                }
-            }
-        }
-
-        graph.remove_node(i).expect("Error removing node");
-    }
-
-    /*
-    let node_indices = graph.node_indices().collect::<Vec<_>>();
-    let indices: Vec<usize> = (0..node_indices.len()).collect::<Vec<_>>();
-
-    indices.par_iter().for_each(|i| {
-        if is_finished.load(std::sync::atomic::Ordering::Relaxed) {
-            return;
-        }
-
-        let i = node_indices[*i];
-        let mut cur_depth = 0;
-
-        let mut queue = vec![(i, cur_depth)];
-        let mut used = HashSet::new();
-        let neighbors = graph.neighbors(i.into()).collect::<Vec<_>>();
-        neighbors.into_iter().for_each(|x| {
-            if !used.contains(&x) {
-                used.insert(x);
-                queue.push((x, cur_depth + 1));
-            }
-        });
-
-        cur_depth += 1;
-
-        let mut working_queue: Vec<(NodeIndex, u8)> = queue.clone();
-        let mut new_queue = Vec::new();
-
-        while cur_depth < depth {
-
-            for (node_idx, node_depth) in working_queue.iter() {
-                // Depth we are working on
-                if *node_depth < cur_depth {
-                    continue
-                }
-
-                // Only on nodes at the current depth do we extract more neighbors
-                let neighbors = graph.neighbors((*node_idx).into()).collect::<Vec<_>>();
-                neighbors.into_iter().for_each(|x| {
-                    if !used.contains(&x) {
-                        used.insert(x);
-                        new_queue.push((x, cur_depth + 1));
-                    }
-                });
-            }
-
-            working_queue = new_queue.clone();
-            queue.extend(new_queue.clone());
-            new_queue.clear();
-            cur_depth += 1;
-        }
-
-        let queue: Vec<(NodeIndex, NodeIndex, u8)> = queue
-            .iter()
-            .map(|(x, y)| (i, *x, *y))
-            .collect();
-
-        let mut result = sender.try_send(TaxonomyWriterMessage::Write(queue));
-
-        while let Err(msg) = result {
-            match msg {
-                crossbeam::channel::TrySendError::Full(msg) => {
-                    std::thread::sleep(std::time::Duration::from_millis(270));
-                    result = sender.try_send(msg);
-                },
-                crossbeam::channel::TrySendError::Disconnected(_) => {
-                    is_finished.store(true, std::sync::atomic::Ordering::Relaxed);
-                    return;
-                }
-            }
-
-        }
-    });
-    */
-
-    is_finished.store(true, std::sync::atomic::Ordering::Relaxed);
-
-    db_writer_join_handle.join().unwrap();
-
-    log::info!("Finished writing to database");
-}
-
 pub fn build_taxonomy_graph_generator(nodes_file: &str, names_file: &str) -> BatchGenerator {
     // acc2tax todo: change it so we are passing &str
     let names = parse_names(names_file.to_string());
@@ -849,61 +188,39 @@ impl Dataset<TaxaDistance> for BatchGenerator {
         self.epoch_size
     }
 
-    fn get(&self, index: usize) -> Option<TaxaDistance> {
+    fn get(&self, _index: usize) -> Option<TaxaDistance> {
         let mut rng = thread_rng();
-        // Get two random nodes
 
         let len = self.graph.node_count();
 
         let i = rng.gen_range(0..len) as u32;
 
-        // Get random depth between 1 and 4
-        let depth = rng.gen_range(1..5);
+        // Let's random walk to find 16 nearby nodes
+        // Then 16 far away nodes
 
+        // Nearby <= 6
+        // Distance >= 20 (max is 54, I think)
         let idx = self.graph.node_indices().nth(i as usize).unwrap();
 
-        let mut cur_depth = 1;
+        let mut branches = [0; 2];
+        let mut distances = [0; 2];
 
-        let mut queue = Vec::new();
-        let neighbors = self.graph.neighbors(i.into()).collect::<Vec<_>>();
-        let mut used = HashSet::new();
+        //for i in 0..20 {
+        let depth = rng.gen_range(1..8);
+        let (node, depth) = self.random_walk(idx, depth);
+        branches[0] = node.index() as u32;
+        distances[0] = depth as u32;
+        // }
 
-        neighbors.into_iter().for_each(|x| {
-            if !used.contains(&x) {
-                used.insert(x);
-                queue.push((x, cur_depth + 1));
-            }
-        });
-
-        cur_depth += 1;
-
-        let mut working_queue: Vec<(NodeIndex, u8)> = queue.clone();
-        let mut new_queue = Vec::new();
-
-        while cur_depth < depth {
-            for (node_idx, node_depth) in working_queue.iter() {
-                // Only on nodes at the current depth do we extract more neighbors
-                let neighbors = self.graph.neighbors((*node_idx).into()).collect::<Vec<_>>();
-                neighbors.into_iter().for_each(|x| {
-                    if !used.contains(&x) {
-                        used.insert(x);
-                        new_queue.push((x, cur_depth + 1));
-                    }
-                });
-            }
-
-            working_queue = new_queue.clone();
-            queue.extend(new_queue.clone());
-            new_queue.clear();
-            cur_depth += 1;
-        }
-
-        // Choose a random one of the correct depth
-        let (j, dist) = queue[rng.gen_range(0..queue.len())];
+        let depth = rng.gen_range(10..40);
+        let (node, depth) = self.random_walk(idx, depth);
+        branches[1] = node.index() as u32;
+        distances[1] = depth as u32;
 
         Some(TaxaDistance {
-            branches: [i as u32, j.index() as u32],
-            distance: dist as f32,
+            origin: idx.index() as u32,
+            branches,
+            distances,
         })
     }
 
@@ -934,6 +251,34 @@ impl BatchGenerator {
             epoch_size: batch_size,
             levels,
         }
+    }
+
+    pub fn random_walk(&self, start: NodeIndex, depth: u8) -> (NodeIndex, u8) {
+        // Find a node at depth from the current start
+        let mut rng = self.rng.clone();
+        let mut current = start;
+        let mut current_depth = 0;
+
+        while current_depth < depth {
+            let neighbors = self.graph.neighbors(current).collect::<Vec<NodeIndex>>();
+            let next = neighbors[rng.gen_range(0..neighbors.len())];
+            current = next;
+            current_depth += 1;
+        }
+
+        // Get actual distance with astar
+
+        let distance = astar(
+            Arc::as_ref(&self.graph),
+            start,
+            |finish| finish == current,
+            |e| 1,
+            |_| 0,
+        );
+
+        let distance = distance.unwrap().0 as u8;
+
+        (current, distance)
     }
 
     pub fn taxonomy_size(&self) -> usize {
