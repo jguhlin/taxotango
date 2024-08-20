@@ -12,7 +12,9 @@ use rand_xoshiro::Xoshiro256PlusPlus;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 
 pub mod model;
 pub use model::*;
@@ -106,7 +108,11 @@ impl TaxaLevel {
     }
 }
 
-pub fn build_taxonomy_graph_generator(nodes_file: &str, names_file: &str) -> BatchGenerator {
+pub fn build_taxonomy_graph_generator<const D: usize>(
+    nodes_file: &str,
+    names_file: &str,
+    threads: usize,
+) -> BatchGenerator<D> {
     // acc2tax todo: change it so we are passing &str
     let names = parse_names(names_file.to_string());
     let nodes = parse_nodes(nodes_file.to_string());
@@ -143,7 +149,7 @@ pub fn build_taxonomy_graph_generator(nodes_file: &str, names_file: &str) -> Bat
     // let graph = MatrixGraph::<u32, (), Undirected, Option<()>, u32>::from_edges(&edges);
 
     let mut graph = UnGraph::<u32, (), u32>::with_capacity(nodes.len(), nodes.len());
-    let nodes: HashMap<u32, NodeIndex> = nodes.iter().map(|x| (*x, graph.add_node(*x))).collect();
+    let nodes: HashMap<u32, NodeIndex> = nodes.iter().map(|x| (*x, graph.add_node(1))).collect();
 
     for (x, y) in edges {
         graph.add_edge(nodes[&x], nodes[&y], ());
@@ -155,67 +161,142 @@ pub fn build_taxonomy_graph_generator(nodes_file: &str, names_file: &str) -> Bat
         graph.edge_count()
     );
 
-    let mut count = 0;
+    let (tx, rx) = bounded(8192);
 
-    let mut idx = 0;
-    let mut idx2 = 0;
+    // Spawn threads
+    let mut jhs = Vec::with_capacity(threads);
+
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(1337);
+    let graph = Arc::new(graph);
+    let mut shutdown = Arc::new(AtomicBool::new(false));
+    let current = Arc::new(AtomicUsize::new(0));
+
+    for _ in 0..threads {
+        let tx = tx.clone();
+        let graph = Arc::clone(&graph);
+        let levels = levels.clone();
+        let shutdown = Arc::clone(&shutdown);
+        let mut rng1 = rng.clone();
+        let current = Arc::clone(&current);
+
+        let jh = std::thread::spawn(move || {
+            let len = graph.node_count();
+            let mut rng = rng1;
+
+            // 1/2 are nearby, 1/2 are far away as 'negative' samples
+            let cutoff = (D as f32 * 0.5) as usize;
+            let further = D - cutoff;
+
+            loop {
+                if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+
+                // let i = rng.gen_range(0..len) as u32;
+                // let idx = graph.node_indices().nth(i as usize).unwrap();
+                let mut idx = current.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if idx == len {
+                    current.store(0, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                if idx >= len {
+                    current.store(0, std::sync::atomic::Ordering::Relaxed);
+                    idx = current.fetch_add(1, std::sync::atomic::Ordering::Relaxed);                    
+                }
+
+                let idx = graph.node_indices().nth(idx as usize).unwrap();
+
+                let mut branches = [0; D];
+                let mut distances = [0; D];
+
+                for i in 0..cutoff {
+                    let depth = rng.gen_range(1..8);
+
+                    let mut current = idx;
+                    let mut current_depth = 0;
+
+                    while current_depth < depth {
+                        let neighbors = graph.neighbors(current).collect::<Vec<NodeIndex>>();
+                        let next = neighbors[rng.gen_range(0..neighbors.len())];
+                        current = next;
+                        current_depth += 1;
+                    }
+
+                    // Get actual distance with astar
+
+                    let distance = astar(
+                        Arc::as_ref(&graph),
+                        idx,
+                        |finish| finish == current,
+                        |_| 1,
+                        |_| 0,
+                    );
+
+                    let distance = distance.unwrap().0 as u8;
+
+                    branches[i] = current.index() as u32;
+                    distances[i] = distance as u32;
+                }
+
+                for i in cutoff..further {
+                    // Pick a completely random node
+                    let end = graph
+                        .node_indices()
+                        .nth(rng.gen_range(0..len) as usize)
+                        .unwrap();
+                    let distance = astar(
+                        Arc::as_ref(&graph),
+                        idx,
+                        |finish| finish == end,
+                        |_| 1,
+                        |_| 0,
+                    );
+
+                    // let (node, depth) = self.random_walk(idx, depth);
+                    branches[i] = end.index() as u32;
+                    distances[i] = distance.unwrap().0 as u32;
+                }
+
+                tx.send(TaxaDistance {
+                    origin: idx.index() as u32,
+                    branches,
+                    distances,
+                })
+                .unwrap();
+            }
+        });
+
+        rng.long_jump();
+        jhs.push(jh);
+    }
 
     BatchGenerator {
-        graph: Arc::new(graph),
-        rng: Xoshiro256PlusPlus::seed_from_u64(1337),
-        epoch_size: 1024,
+        epoch_size: graph.node_count(),
+        graph: graph,
         levels,
+        join_handles: jhs,
+        shutdown,
+        receiver: rx,
     }
 }
 
-pub struct BatchGenerator {
+pub struct BatchGenerator<const D: usize> {
     graph: Arc<Graph<u32, (), Undirected, u32>>,
-    // graph: MatrixGraph<u32, (), petgraph::Undirected, std::option::Option<()>, u32>,
-    rng: Xoshiro256PlusPlus,
     epoch_size: usize,
     pub levels: HashMap<u32, TaxaLevel>,
+    join_handles: Vec<JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
+    receiver: crossbeam::channel::Receiver<TaxaDistance<D>>,
 }
 
-impl Dataset<TaxaDistance<2>> for BatchGenerator {
+impl<const D: usize> Dataset<TaxaDistance<D>> for BatchGenerator<D> {
     fn len(&self) -> usize {
         // Batch size of 1024
         self.epoch_size
     }
 
-    fn get(&self, _index: usize) -> Option<TaxaDistance<2>> {
-        let mut rng = thread_rng();
-
-        let len = self.graph.node_count();
-
-        let i = rng.gen_range(0..len) as u32;
-
-        // Let's random walk to find 16 nearby nodes
-        // Then 16 far away nodes
-
-        // Nearby <= 6
-        // Distance >= 20 (max is 54, I think)
-        let idx = self.graph.node_indices().nth(i as usize).unwrap();
-
-        let mut branches = [0; 2];
-        let mut distances = [0; 2];
-
-        //for i in 0..20 {
-        let depth = rng.gen_range(1..8);
-        let (node, depth) = self.random_walk(idx, depth);
-        branches[0] = node.index() as u32;
-        distances[0] = depth as u32;
-        // }
-
-        let depth = rng.gen_range(10..40);
-        let (node, depth) = self.random_walk(idx, depth);
-        branches[1] = node.index() as u32;
-        distances[1] = depth as u32;
-
-        Some(TaxaDistance {
-            origin: idx.index() as u32,
-            branches,
-            distances,
-        })
+    fn get(&self, _index: usize) -> Option<TaxaDistance<D>> {
+        self.receiver.recv().ok()
     }
 
     // Provided methods
@@ -223,7 +304,7 @@ impl Dataset<TaxaDistance<2>> for BatchGenerator {
         self.graph.node_count() == 0
     }
 
-    fn iter(&self) -> DatasetIterator<'_, TaxaDistance<2>>
+    fn iter(&self) -> DatasetIterator<'_, TaxaDistance<D>>
     where
         Self: Sized,
     {
@@ -231,76 +312,69 @@ impl Dataset<TaxaDistance<2>> for BatchGenerator {
     }
 }
 
-impl BatchGenerator {
-    pub fn new(
-        graph: Graph<u32, (), Undirected, u32>,
-        rng: Xoshiro256PlusPlus,
-        batch_size: usize,
-        nodes: Vec<u32>,
-        levels: HashMap<u32, TaxaLevel>,
-    ) -> Self {
+impl<const D: usize> BatchGenerator<D> {
+    pub fn shutdown(&mut self) -> Result<(), &'static str> {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let mut jhs = Vec::new();
+        std::mem::swap(&mut jhs, &mut self.join_handles);
+
+        for jh in jhs {
+            match jh.join() {
+                Ok(_) => {}
+                Err(_) => {
+                    return Err("Error joining batch generator thread");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /*
+
+    pub fn testing() -> Self {
+        let mut graph = UnGraph::<u32, (), u32>::with_capacity(100_000, 100_000);
+        let nodes: HashMap<u32, NodeIndex> = (0..100_000_u32)
+            .into_iter()
+            .map(|x| (x, graph.add_node(1)))
+            .collect();
+
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(1337);
+
+        // Connect nodes to each other in order
+        for i in 0..100_000_u32 {
+            if i > 0 {
+                graph.add_edge(nodes[&(i - 1)], nodes[&i], ());
+            }
+        }
+
+        let levels = HashMap::new();
+
         Self {
             graph: Arc::new(graph),
             rng,
-            epoch_size: batch_size,
+            epoch_size: 1024,
             levels,
         }
     }
+    */
 
-    pub fn random_walk(&self, start: NodeIndex, depth: u8) -> (NodeIndex, u8) {
-        // Find a node at depth from the current start
-        let mut rng = self.rng.clone();
-        let mut current = start;
-        let mut current_depth = 0;
-
-        while current_depth < depth {
-            let neighbors = self.graph.neighbors(current).collect::<Vec<NodeIndex>>();
-            let next = neighbors[rng.gen_range(0..neighbors.len())];
-            current = next;
-            current_depth += 1;
+    pub fn valid(&self) -> Self {
+        let rng = Xoshiro256PlusPlus::seed_from_u64(13371337);
+        BatchGenerator {
+            graph: Arc::clone(&self.graph),
+            epoch_size: 2048,
+            levels: self.levels.clone(),
+            join_handles: vec![],
+            shutdown: Arc::clone(&self.shutdown),
+            receiver: self.receiver.clone(),
         }
-
-        // Get actual distance with astar
-
-        let distance = astar(
-            Arc::as_ref(&self.graph),
-            start,
-            |finish| finish == current,
-            |e| 1,
-            |_| 0,
-        );
-
-        let distance = distance.unwrap().0 as u8;
-
-        (current, distance)
     }
 
     pub fn taxonomy_size(&self) -> usize {
         self.graph.node_count()
-    }
-
-    pub fn train(&self) -> Self {
-        log::info!("Cloning BatchGenerator for training");
-
-        let mut rng = self.rng.clone();
-        rng.long_jump();
-
-        Self {
-            graph: Arc::clone(&self.graph),
-            rng,
-            levels: self.levels.clone(),
-            epoch_size: 1024 * 512,
-        }
-    }
-
-    pub fn test(&self) -> Self {
-        // Limit data
-        Self {
-            graph: Arc::clone(&self.graph),
-            rng: self.rng.clone(),
-            levels: self.levels.clone(),
-            epoch_size: 1024,
-        }
     }
 }
 
