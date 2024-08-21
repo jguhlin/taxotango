@@ -281,7 +281,7 @@ pub fn train<const D: usize, B: AutodiffBackend>(
     batch_gen: crate::BatchGenerator<D>,
     device: B::Device,
 ) {
-    create_artifact_dir(artifact_dir);
+    // create_artifact_dir(artifact_dir);
     config
         .save(format!("{artifact_dir}/config.json"))
         .expect("Config should be saved successfully");
@@ -318,7 +318,7 @@ pub fn train<const D: usize, B: AutodiffBackend>(
         .build(
             config.model.init::<B>(&device),
             config.optimizer.init(),
-            burn::lr_scheduler::linear::LinearLrSchedulerConfig::new(5e-3, 1e-6, 40_000).init(),
+            burn::lr_scheduler::linear::LinearLrSchedulerConfig::new(8e-3, 1e-6, 1_000_000).init(),
         );
 
     log::trace!("Learner built");

@@ -66,7 +66,7 @@ fn main() {
         let adamwconfig = AdamWConfig::new()
             .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(1.0)));
 
-        crate::model::train::<8, MyAutodiffBackend>(
+        crate::model::train::<16, MyAutodiffBackend>(
             "/mnt/data/data/taxontango_training",
             crate::model::TrainingConfig::new(config, adamwconfig),
             generator,
