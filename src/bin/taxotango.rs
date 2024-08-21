@@ -1,43 +1,109 @@
+// use mimalloc::MiMalloc;
+
+// #[global_allocator]
+// static GLOBAL: MiMalloc = MiMalloc;
+
+use burn::backend::{autodiff::Autodiff, Wgpu};
+use burn::data::dataloader::batcher::Batcher;
+use burn::data::dataset::Dataset;
+use burn::optim::AdamWConfig;
+use burn::prelude::*;
+use burn::tensor::Tensor;
+
+use flexi_logger::FileSpec;
 use taxotangolib::*;
 
-use burn::backend::{wgpu::AutoGraphicsApi, Autodiff, Wgpu};
-use burn::prelude::*;
-
 fn main() {
-    env_logger::init();
+    let debug = false;
+
+    // Highest level of logging is debug
+    // Lowest level of logging is error
+
+    // env_logger::init();
+    flexi_logger::Logger::try_with_str("error")
+        .expect("Invalid log level")
+        .log_to_file(FileSpec::default()) // write logs to file
+        .start()
+        .expect("FlexiLogger initialization failed");
 
     let nodes_file = "/mnt/data/data/nt/taxdmp/nodes.dmp";
     let names_file = "/mnt/data/data/nt/taxdmp/names.dmp";
 
-    let mut batch_gen = build_taxonomy_graph(nodes_file, names_file);
-
-    // log::debug!("Generating first test batch");
-
-    // let batch = batch_gen.generate_batch();
-    // println!("{:?}", batch);
+    let mut generator = build_taxonomy_graph_generator(nodes_file, names_file, 16);
 
     let config = PoincareTaxonomyEmbeddingModelConfig {
-        taxonomy_size: batch_gen.nodes.len(),
+        taxonomy_size: generator.taxonomy_size(),
         embedding_size: 16,
     };
 
-    type MyBackend = Wgpu<AutoGraphicsApi, f32, i32>;
+    type MyBackend = Wgpu<f32, i32>;
+    type MyAutodiffBackend = Autodiff<MyBackend>;
+
     let device = burn::backend::wgpu::WgpuDevice::default();
 
-    let nn: PoincareTaxonomyEmbeddingModel<Wgpu> = config.init(&device);
+    if debug {
+        let model = config.init::<MyBackend>(&device);
+        // let batch = TaxaDistance {
+        //origin: 1,
+        //branches: [1, 2, 3, 4, 5, 6, 7, 8],
+        //distances: [1, 2, 3, 4, 5, 6, 7, 8],
+        //};
 
-    let output = nn.forward(Tensor::<MyBackend, 2, Int>::from_data(
-        [[1, 2], [3, 4], [1, 6]],
-        &device,
-    ));
+        let tb = TangoBatcher::new(device);
+        let batch = tb.batch(
+            (0..16)
+                .map(|i| generator.get(i).unwrap())
+                .collect::<Vec<_>>(),
+        );
 
-    println!("{}", output);
+        println!("{:#?}", batch);
+        println!("{:#?}", batch.origins);
 
-    // let device = Default::default();
-    // Creation of two tensors, the first with explicit values and the second one with ones, with the same shape as the first
-    // let tensor_1 = Tensor::<Backend, 2>::from_data([[2., 3.], [4., 5.]], &device);
-    // let tensor_2 = Tensor::<Backend, 2>::ones_like(&tensor_1);
+        let output = model.forward(batch.origins, batch.branches);
+        println!("{}", output);
+        generator.shutdown();
+    } else {
+        let adamwconfig = AdamWConfig::new()
+            .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(1.0)));
 
-    // Print the element-wise addition (done with the WGPU backend) of the two tensors.
-    // println!("{}", tensor_1 + tensor_2);
+        crate::model::train::<16, MyAutodiffBackend>(
+            "/mnt/data/data/taxontango_training",
+            crate::model::TrainingConfig::new(config, adamwconfig),
+            generator,
+            device,
+        );
+        // crate::model::custom_training_loop::<MyAutodiffBackend>(generator, &device);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_batcher() {
+        let generator = BatchGenerator::testing();
+
+        let config = PoincareTaxonomyEmbeddingModelConfig {
+            taxonomy_size: generator.taxonomy_size(),
+            embedding_size: 3,
+        };
+
+        type MyBackend = Wgpu<f32, i32>;
+
+        let device = burn::backend::wgpu::WgpuDevice::default();
+
+        let model = config.init::<MyBackend>(&device);
+
+        let tb = TangoBatcher::new(device);
+        let batch = tb.batch(
+            (0..10)
+                .map(|i| generator.get(i).unwrap())
+                .collect::<Vec<_>>(),
+        );
+
+        let output = model.forward(batch.origins, batch.branches);
+        // println!("{:#?}", output);
+        println!("{}", output);
+    }
 }
