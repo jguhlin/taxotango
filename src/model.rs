@@ -1,5 +1,6 @@
 use burn::backend::autodiff::grads::Gradients;
 use burn::lr_scheduler;
+use burn::record::Recorder;
 use burn::train::metric::LearningRateMetric;
 use burn::{
     data::dataloader::{batcher::Batcher, DataLoaderBuilder},
@@ -17,6 +18,7 @@ use burn::{
 use nn::loss::MseLoss;
 use nn::{Linear, LinearConfig};
 use serde::{Deserialize, Serialize};
+use rerun::{demo_util::grid, external::glam};
 
 // Define the model configuration
 #[derive(Config)]
@@ -278,10 +280,10 @@ fn create_artifact_dir(artifact_dir: &str) {
 pub fn train<const D: usize, B: AutodiffBackend>(
     artifact_dir: &str,
     config: TrainingConfig,
-    batch_gen: crate::BatchGenerator<D>,
+    mut batch_gen: crate::BatchGenerator<D>,
     device: B::Device,
 ) {
-    // create_artifact_dir(artifact_dir);
+    create_artifact_dir(artifact_dir);
     config
         .save(format!("{artifact_dir}/config.json"))
         .expect("Config should be saved successfully");
@@ -291,7 +293,7 @@ pub fn train<const D: usize, B: AutodiffBackend>(
     let batcher_train: TangoBatcher<B> = TangoBatcher::<B>::new(device.clone());
     let batcher_valid = TangoBatcher::<B::InnerBackend>::new(device.clone());
 
-    let valid_ds = batch_gen.valid();
+    let mut valid_ds = batch_gen.valid();
 
     let dataloader_train = DataLoaderBuilder::new(batcher_train)
         .batch_size(config.batch_size)

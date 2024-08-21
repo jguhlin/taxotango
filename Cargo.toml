@@ -22,6 +22,7 @@ crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 mimalloc = "0.1.43"
 zstd = { version = "0.13.2", features = ["zstdmt"] }
 flexi_logger = "0.28.5"
+rerun = "0.18.0"
 # burn-wgpu = { git = "https://github.com/tracel-ai/burn/tree/main/crates/burn-wgpu", features = ["std"], no-default-features = true }
 
 [profile.release]
