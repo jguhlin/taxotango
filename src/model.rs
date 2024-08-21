@@ -78,7 +78,7 @@ impl L2Norm {
 // Define the model structure
 #[derive(Module, Debug)]
 pub struct PoincareTaxonomyEmbeddingModel<B: Backend> {
-    embedding_token: Embedding<B>,
+    pub embedding_token: Embedding<B>,
     l2_norm: L2Norm,
     poincare_distance: PoincareDistance,
     // scaling_inner: Linear<B>,
@@ -259,15 +259,15 @@ pub struct TrainingConfig {
     // pub optimizer: AdamConfig,
     // pub optimizer: SgdConfig,
     pub optimizer: AdamWConfig,
-    #[config(default = 1024)]
+    #[config(default = 128)]
     pub num_epochs: usize,
-    #[config(default = 256)]
+    #[config(default = 8192)]
     pub batch_size: usize,
-    #[config(default = 6)]
+    #[config(default = 1)]
     pub num_workers: usize,
     #[config(default = 1337002)]
     pub seed: u64,
-    #[config(default = 1.0e-4)]
+    #[config(default = 6.0e-3)]
     pub learning_rate: f64,
 }
 
@@ -340,6 +340,8 @@ pub fn custom_training_loop<const D: usize, B: AutodiffBackend>(
 ) {
     println!("Starting training loop");
 
+    let rec = rerun::RecordingStreamBuilder::new("rerun_embeddings").spawn().expect("Failed to start recording stream");
+
     // let adamconfig = AdamConfig::new()
     // .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(1.0)));
 
@@ -347,11 +349,11 @@ pub fn custom_training_loop<const D: usize, B: AutodiffBackend>(
     //.with_gradient_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(0.1)));
 
     let adamwconfig = AdamWConfig::new();
-    // .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(1.0)));
+        //.with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(1.0)));
 
     let config = PoincareTaxonomyEmbeddingModelConfig {
         taxonomy_size: batch_gen.taxonomy_size(),
-        embedding_size: 16,
+        embedding_size: 3,
     };
 
     B::seed(1337);
@@ -362,12 +364,19 @@ pub fn custom_training_loop<const D: usize, B: AutodiffBackend>(
     let mut model: PoincareTaxonomyEmbeddingModel<B> = config.model.init(device);
     let mut optim = config.optimizer.init();
 
-    if model.embedding_token.weight.contains_nan().into_scalar() {
-        panic!("NaN detected in model, aborting - Did not even start!");
-    }
-
     let batcher_train: TangoBatcher<B> = TangoBatcher::<B>::new(device.clone());
     let batcher_valid = TangoBatcher::<B::InnerBackend>::new(device.clone());
+
+    let colors = batch_gen.colors.clone();
+    let taxa_levels_in_order = batch_gen.levels_in_order.clone();
+    let taxa_names = batch_gen.taxa_names.clone();
+
+    // Combine taxa level and taxa name
+    let per_node_string: Vec<String> = taxa_levels_in_order
+        .iter()
+        .zip(taxa_names.iter())
+        .map(|(level, name)| format!("{}: {}", level, name))
+        .collect();
 
     let ds_valid = batch_gen.valid();
 
@@ -385,6 +394,22 @@ pub fn custom_training_loop<const D: usize, B: AutodiffBackend>(
 
     // Iterate over our training and validation loop for X epochs.
     for epoch in 1..config.num_epochs + 1 {
+
+        let embedding_weights = model.embedding_token.weight.val().into_data();
+        let j = embedding_weights.to_vec::<f32>().unwrap();
+      
+        // Chunks into dimensions (here, 3)
+        let mut chunks = j.chunks(3);
+        rec.log(
+            "points",
+            &rerun::Points3D::new(
+                chunks
+                    .by_ref()
+                    .map(|chunk| glam::Vec3::new(chunk[0], chunk[1], chunk[2])),
+            ).with_colors(colors.clone())
+            .with_labels(per_node_string.clone()),
+        ).expect("Failed to log points");
+
         // Implement our training loop.
         for (iteration, batch) in dataloader_train.iter().enumerate() {
             let output = model.forward(batch.origins, batch.branches);
@@ -401,48 +426,11 @@ pub fn custom_training_loop<const D: usize, B: AutodiffBackend>(
                 loss.clone().into_scalar(),
             );
 
-            // Gradients for the current backward pass
             let grads = loss.backward();
-
-            // Gradients linked to each parameter of the model.
             let grads = GradientsParams::from_grads(grads, &model);
-
-            // Get param ids
-            let param_ids = burn::module::list_param_ids(&model);
-            println!("Param ids: {:?}", param_ids);
-            println!("Len: {} - Is Empty? {} ", grads.len(), grads.is_empty());
-            //for id in param_ids {
-            //let grad: Tensor<B, 1> = match grads.get(&id) {
-            //Some(grad) => grad.clone(),
-            //None => continue,
-            //};
-
-            //println!("{}", grad);
-            //}
 
             // Update the model using the optimizer.
             model = optim.step(config.learning_rate, model, grads);
-
-            // If any nan's detected, abort and print out most recent data
-            if model.embedding_token.weight.contains_nan().into_scalar() {
-                println!("Output: {}", output);
-                println!("Distances: {}", batch.distances);
-
-                panic!("NaN detected in model, aborting training - Pre normalization");
-            }
-
-            // let (id, weights) = model.embedding_token.weight.consume();
-
-            // model.embedding_token.weight = burn::module::Param::initialized(id, normalize_to_poincare_ball(weights));
-            // model.embedding_token.weight = model.embedding_token.weight.map(|x| normalize_to_poincare_ball(x));
-
-            // If any nan's detected, abort and print out most recent data
-            if model.embedding_token.weight.contains_nan().into_scalar() {
-                println!("Output: {}", output);
-                println!("Distances: {}", batch.distances);
-
-                panic!("NaN detected in model, aborting training");
-            }
         }
 
         // Get the model without autodiff.
@@ -465,6 +453,25 @@ pub fn custom_training_loop<const D: usize, B: AutodiffBackend>(
             );
         }
     }
+}
+
+pub fn inference<B: Backend>(artifact_dir: &str, device: B::Device, item: TaxaDistance<1>) {
+    let config = TrainingConfig::load(format!("{artifact_dir}/config.json"))
+        .expect("Config should exist for the model");
+    let record = CompactRecorder::new()
+        .load(format!("{artifact_dir}/model").into(), &device)
+        .expect("Trained model should exist");
+
+    let model = config.model.init::<B>(&device).load_record(record);
+
+    let batcher = TangoBatcher::<B>::new(device.clone());
+    let batch = batcher.batch(vec![item]);
+    let output = model.forward(batch.origins, batch.branches);
+
+    println!("{}", model.scaling_layer.weight.val());
+
+    println!("Inference");
+    println!("Predicted {} Expected {}", output, batch.distances);
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ use crossbeam::channel::bounded;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::prelude::*;
 use rand_xoshiro::Xoshiro256PlusPlus;
+use rerun::Color;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -106,6 +107,48 @@ impl TaxaLevel {
             _ => panic!("Unknown rank: {}", rank),
         }
     }
+
+    pub fn color(&self) -> Color {
+        match self {
+            TaxaLevel::NoRank => Color::from_rgb(128, 128, 128), // Gray
+            TaxaLevel::Root => Color::from_rgb(0, 0, 0), // Black
+            TaxaLevel::Superkingdom => Color::from_rgb(255, 105, 180), // Hot Pink
+            TaxaLevel::Kingdom => Color::from_rgb(255, 20, 147), // Deep Pink
+            TaxaLevel::Subkingdom => Color::from_rgb(200, 20, 110), // Darker Deep Pink
+            TaxaLevel::Superphylum => Color::from_rgb(255, 150, 255), // Lighter Violet
+            TaxaLevel::Phylum => Color::from_rgb(238, 130, 238), // Violet
+            TaxaLevel::Subphylum => Color::from_rgb(200, 100, 200), // Darker Violet
+            TaxaLevel::Superclass => Color::from_rgb(100, 0, 160), // Lighter Indigo
+            TaxaLevel::Class => Color::from_rgb(75, 0, 130), // Indigo
+            TaxaLevel::Infraclass => Color::from_rgb(60, 0, 110), // Darker Indigo
+            TaxaLevel::Subclass => Color::from_rgb(60, 0, 110), // Darker Indigo
+            TaxaLevel::Superorder => Color::from_rgb(255, 255, 100), // Lighter Yellow
+            TaxaLevel::Order => Color::from_rgb(255, 255, 0), // Yellow
+            TaxaLevel::Parvorder => Color::from_rgb(200, 200, 0), // Darker Yellow
+            TaxaLevel::Infraorder => Color::from_rgb(200, 200, 0), // Darker Yellow
+            TaxaLevel::Suborder => Color::from_rgb(200, 200, 0), // Darker Yellow
+            TaxaLevel::Superfamily => Color::from_rgb(255, 215, 0), // Gold
+            TaxaLevel::Family => Color::from_rgb(255, 165, 0), // Orange
+            TaxaLevel::Subfamily => Color::from_rgb(255, 140, 0), // Darker Orange
+            TaxaLevel::Tribe => Color::from_rgb(0, 0, 255), // Blue
+            TaxaLevel::Subtribe => Color::from_rgb(0, 0, 200), // Darker Blue
+            TaxaLevel::Genus => Color::from_rgb(0, 128, 0), // Green
+            TaxaLevel::Subgenus => Color::from_rgb(0, 100, 0), // Darker Green
+            TaxaLevel::SpeciesGroup => Color::from_rgb(200, 0, 0), // Darker Red
+            TaxaLevel::Species => Color::from_rgb(255, 0, 0), // Bright Red
+            TaxaLevel::Subspecies => Color::from_rgb(200, 0, 0), // Darker Red
+            TaxaLevel::Clade => Color::from_rgb(128, 0, 128), // Purple
+            TaxaLevel::Forma => Color::from_rgb(255, 20, 147), // Deep Pink
+            TaxaLevel::Varietas => Color::from_rgb(255, 20, 147), // Deep Pink
+            TaxaLevel::SpeciesSubgroup => Color::from_rgb(200, 0, 0), // Darker Red
+            TaxaLevel::Subcohort => Color::from_rgb(200, 50, 0), // Darker Red-Orange
+            TaxaLevel::Cohort => Color::from_rgb(255, 69, 0), // Red-Orange
+            TaxaLevel::Section => Color::from_rgb(34, 139, 34), // Forest Green
+            TaxaLevel::Subsection => Color::from_rgb(34, 139, 34), // Forest Green
+            TaxaLevel::Series => Color::from_rgb(34, 139, 34), // Forest Green
+        }
+    }
+
 }
 
 pub fn build_taxonomy_graph_generator<const D: usize>(
@@ -134,6 +177,16 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
         .map(|(idx, rank)| (idx as u32, TaxaLevel::from_str(rank)))
         .collect();
 
+    let levels_in_order: Vec<String> = nodes.1.iter().map(|x| x.clone()).collect();
+
+    let colors: Vec<Color> = nodes
+        .1
+        .iter()
+        .map(|rank| TaxaLevel::from_str(rank).color())
+        .collect();
+
+    let taxa_names: Vec<String> = names.0;
+
     // Filter for distinct, pull from both x and y
     let nodes: Vec<u32> = edges.iter().flat_map(|(x, y)| [x, y]).copied().collect();
     let nodes = nodes.into_iter().collect::<HashSet<u32>>();
@@ -161,7 +214,7 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
         graph.edge_count()
     );
 
-    let (tx, rx) = bounded(8192);
+    let (tx, rx) = bounded(8192 * 8);
 
     // Spawn threads
     let mut jhs = Vec::with_capacity(threads);
@@ -277,16 +330,24 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
         join_handles: jhs,
         shutdown,
         receiver: rx,
+        nodes,
+        colors,
+        levels_in_order,
+        taxa_names, 
     }
 }
 
 pub struct BatchGenerator<const D: usize> {
-    graph: Arc<Graph<u32, (), Undirected, u32>>,
+    pub graph: Arc<Graph<u32, (), Undirected, u32>>,
     epoch_size: usize,
     pub levels: HashMap<u32, TaxaLevel>,
     join_handles: Vec<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
     receiver: crossbeam::channel::Receiver<TaxaDistance<D>>,
+    pub nodes: HashMap<u32, NodeIndex>,
+    pub colors: Vec<Color>,
+    pub levels_in_order: Vec<String>,
+    pub taxa_names: Vec<String>,
 }
 
 impl<const D: usize> Dataset<TaxaDistance<D>> for BatchGenerator<D> {
@@ -370,6 +431,10 @@ impl<const D: usize> BatchGenerator<D> {
             join_handles: vec![],
             shutdown: Arc::clone(&self.shutdown),
             receiver: self.receiver.clone(),
+            nodes: self.nodes.clone(),
+            colors: self.colors.clone(),
+            levels_in_order: self.levels_in_order.clone(),
+            taxa_names: self.taxa_names.clone(),
         }
     }
 
