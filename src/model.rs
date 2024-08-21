@@ -91,8 +91,8 @@ impl PoincareTaxonomyEmbeddingModelConfig {
     /// Initializes a model with default weights
     pub fn init<B: Backend>(&self, device: &B::Device) -> PoincareTaxonomyEmbeddingModel<B> {
         let initializer = burn::nn::Initializer::Uniform {
-            min: -0.01,
-            max: 0.01,
+            min: -0.45,
+            max: 0.45,
         };
 
         //let layer_norm = LayerNormConfig::new(self.embedding_size)
@@ -259,7 +259,7 @@ pub struct TrainingConfig {
     // pub optimizer: AdamConfig,
     // pub optimizer: SgdConfig,
     pub optimizer: AdamWConfig,
-    #[config(default = 128)]
+    #[config(default = 2048)]
     pub num_epochs: usize,
     #[config(default = 8192)]
     pub batch_size: usize,
@@ -267,7 +267,7 @@ pub struct TrainingConfig {
     pub num_workers: usize,
     #[config(default = 1337002)]
     pub seed: u64,
-    #[config(default = 6.0e-3)]
+    #[config(default = 5.0e-3)]
     pub learning_rate: f64,
 }
 
@@ -397,9 +397,10 @@ pub fn custom_training_loop<const D: usize, B: AutodiffBackend>(
 
         let embedding_weights = model.embedding_token.weight.val().into_data();
         let j = embedding_weights.to_vec::<f32>().unwrap();
-      
+  
         // Chunks into dimensions (here, 3)
         let mut chunks = j.chunks(3);
+
         rec.log(
             "points",
             &rerun::Points3D::new(
