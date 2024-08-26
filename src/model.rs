@@ -1,5 +1,6 @@
 use burn::backend::autodiff::grads::Gradients;
 use burn::lr_scheduler;
+use burn::lr_scheduler::LrScheduler;
 use burn::record::Recorder;
 use burn::train::metric::LearningRateMetric;
 use burn::{
@@ -17,8 +18,8 @@ use burn::{
 };
 use nn::loss::MseLoss;
 use nn::{Linear, LinearConfig};
-use serde::{Deserialize, Serialize};
 use rerun::{demo_util::grid, external::glam};
+use serde::{Deserialize, Serialize};
 
 // Define the model configuration
 #[derive(Config)]
@@ -57,7 +58,7 @@ impl PoincareDistance {
 
         let distance = distance.squeeze(2);
 
-        acosh(distance.mul_scalar(2).add_scalar(1.0))
+        acosh(distance.mul_scalar(2.0).add_scalar(1.0))
     }
 }
 
@@ -134,8 +135,9 @@ impl<B: Backend> PoincareTaxonomyEmbeddingModel<B> {
         // Calculate the Poincaré distance
         let distances = self.poincare_distance.forward(origins, destinations);
         // distances.mul_scalar(100.0)
-        let distances: Tensor<B, 3> = distances.unsqueeze_dims(&[-1]);
-        self.scaling_layer.forward(distances).squeeze(2)
+        // let distances: Tensor<B, 3> = distances.unsqueeze_dims(&[-1]);
+        distances
+        // self.scaling_layer.forward(distances).squeeze(2)
 
         /*
 
@@ -204,14 +206,14 @@ impl<B: Backend, const N: usize> Batcher<TaxaDistance<N>, TangoBatch<B>> for Tan
             .iter()
             .map(|item| TensorData::from(item.branches))
             .map(|data| Tensor::<B, 1, Int>::from_data(data.convert::<u32>(), &self.device))
-            .map(|tensor| tensor.reshape([1, 8]))
+            .map(|tensor| tensor.reshape([1, N]))
             .collect();
 
         let distances = items
             .iter()
             .map(|item| TensorData::from([item.distances]))
             .map(|data| Tensor::<B, 2>::from_data(data.convert::<u32>(), &self.device))
-            .map(|tensor| tensor.reshape([1, 8]))
+            .map(|tensor| tensor.reshape([1, N]))
             .collect();
 
         let branches = Tensor::cat(branches, 0).to_device(&self.device);
@@ -261,13 +263,13 @@ pub struct TrainingConfig {
     pub optimizer: AdamWConfig,
     #[config(default = 2048)]
     pub num_epochs: usize,
-    #[config(default = 8192)]
+    #[config(default = 16384)]
     pub batch_size: usize,
     #[config(default = 1)]
     pub num_workers: usize,
     #[config(default = 1337002)]
     pub seed: u64,
-    #[config(default = 5.0e-3)]
+    #[config(default = 1.0e-4)]
     pub learning_rate: f64,
 }
 
@@ -320,7 +322,7 @@ pub fn train<const D: usize, B: AutodiffBackend>(
         .build(
             config.model.init::<B>(&device),
             config.optimizer.init(),
-            burn::lr_scheduler::linear::LinearLrSchedulerConfig::new(8e-3, 1e-6, 1_000_000).init(),
+            burn::lr_scheduler::linear::LinearLrSchedulerConfig::new(5e-3, 1e-6, 100_000).init(),
         );
 
     log::trace!("Learner built");
@@ -340,7 +342,8 @@ pub fn custom_training_loop<const D: usize, B: AutodiffBackend>(
 ) {
     println!("Starting training loop");
 
-    let rec = rerun::RecordingStreamBuilder::new("rerun_embeddings").spawn().expect("Failed to start recording stream");
+    // let rec = rerun::RecordingStreamBuilder::new("rerun_embeddings").spawn().expect("Unable to connect to rerun");
+    // .spawn().expect("Failed to start recording stream");
 
     // let adamconfig = AdamConfig::new()
     // .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(1.0)));
@@ -348,15 +351,18 @@ pub fn custom_training_loop<const D: usize, B: AutodiffBackend>(
     //let sgdconfig = SgdConfig::new()
     //.with_gradient_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(0.1)));
 
-    let adamwconfig = AdamWConfig::new();
-        //.with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(1.0)));
+    let adamwconfig = AdamWConfig::new()
+        .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(1.0)));
 
     let config = PoincareTaxonomyEmbeddingModelConfig {
         taxonomy_size: batch_gen.taxonomy_size(),
-        embedding_size: 3,
+        embedding_size: 8,
     };
 
     B::seed(1337);
+
+    let mut lr =
+        burn::lr_scheduler::linear::LinearLrSchedulerConfig::new(5e-2, 1e-6, 1_000_000).init();
 
     let config = TrainingConfig::new(config, adamwconfig);
 
@@ -394,10 +400,10 @@ pub fn custom_training_loop<const D: usize, B: AutodiffBackend>(
 
     // Iterate over our training and validation loop for X epochs.
     for epoch in 1..config.num_epochs + 1 {
-
+        /*
         let embedding_weights = model.embedding_token.weight.val().into_data();
         let j = embedding_weights.to_vec::<f32>().unwrap();
-  
+
         // Chunks into dimensions (here, 3)
         let mut chunks = j.chunks(3);
 
@@ -409,7 +415,7 @@ pub fn custom_training_loop<const D: usize, B: AutodiffBackend>(
                     .map(|chunk| glam::Vec3::new(chunk[0], chunk[1], chunk[2])),
             ).with_colors(colors.clone())
             .with_labels(per_node_string.clone()),
-        ).expect("Failed to log points");
+        ).expect("Failed to log points"); */
 
         // Implement our training loop.
         for (iteration, batch) in dataloader_train.iter().enumerate() {
@@ -431,7 +437,8 @@ pub fn custom_training_loop<const D: usize, B: AutodiffBackend>(
             let grads = GradientsParams::from_grads(grads, &model);
 
             // Update the model using the optimizer.
-            model = optim.step(config.learning_rate, model, grads);
+            // model = optim.step(config.learning_rate, model, grads);
+            model = optim.step(LrScheduler::<B>::step(&mut lr), model, grads);
         }
 
         // Get the model without autodiff.

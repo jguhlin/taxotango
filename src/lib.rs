@@ -1,20 +1,20 @@
 use burn::data::dataset::{Dataset, DatasetIterator};
+use petgraph::adj::NodeIndices;
 use petgraph::algo::astar;
 use petgraph::prelude::*;
-// Uses too much memory
-// use petgraph::algo::floyd_warshall;
-use burn::data::dataset::SqliteDatasetStorage;
 use crossbeam::channel::bounded;
-use indicatif::{ProgressBar, ProgressStyle};
+use petgraph::graph::{NodeIndex, UnGraph};
+use rand::distributions::WeightedIndex;
 use rand::prelude::*;
+use rand::seq::SliceRandom;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use rerun::Color;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
 pub mod model;
@@ -27,7 +27,6 @@ pub enum TaxonomyWriterMessage {
 
 #[derive(PartialEq, PartialOrd, Eq, Ord, Debug, Clone, Copy)]
 pub enum TaxaLevel {
-    NoRank,
     Root,
     Superkingdom,
     Kingdom,
@@ -37,13 +36,15 @@ pub enum TaxaLevel {
     Subphylum,
     Superclass,
     Class,
-    Infraclass,
     Subclass,
+    Infraclass,
+    Cohort,
+    Subcohort,
     Superorder,
     Order,
-    Parvorder,
-    Infraorder,
     Suborder,
+    Infraorder,
+    Parvorder,
     Superfamily,
     Family,
     Subfamily,
@@ -52,17 +53,16 @@ pub enum TaxaLevel {
     Genus,
     Subgenus,
     SpeciesGroup,
+    SpeciesSubgroup,
     Species,
     Subspecies,
-    Clade,
-    Forma,
     Varietas,
-    SpeciesSubgroup,
-    Subcohort,
-    Cohort,
+    Forma,
     Section,
     Subsection,
     Series,
+    Clade,
+    NoRank,
 }
 
 impl TaxaLevel {
@@ -111,7 +111,7 @@ impl TaxaLevel {
     pub fn color(&self) -> Color {
         match self {
             TaxaLevel::NoRank => Color::from_rgb(128, 128, 128), // Gray
-            TaxaLevel::Root => Color::from_rgb(0, 0, 0), // Black
+            TaxaLevel::Root => Color::from_rgb(0, 0, 0),         // Black
             TaxaLevel::Superkingdom => Color::from_rgb(255, 105, 180), // Hot Pink
             TaxaLevel::Kingdom => Color::from_rgb(255, 20, 147), // Deep Pink
             TaxaLevel::Subkingdom => Color::from_rgb(200, 20, 110), // Darker Deep Pink
@@ -119,36 +119,35 @@ impl TaxaLevel {
             TaxaLevel::Phylum => Color::from_rgb(238, 130, 238), // Violet
             TaxaLevel::Subphylum => Color::from_rgb(200, 100, 200), // Darker Violet
             TaxaLevel::Superclass => Color::from_rgb(100, 0, 160), // Lighter Indigo
-            TaxaLevel::Class => Color::from_rgb(75, 0, 130), // Indigo
+            TaxaLevel::Class => Color::from_rgb(75, 0, 130),     // Indigo
             TaxaLevel::Infraclass => Color::from_rgb(60, 0, 110), // Darker Indigo
-            TaxaLevel::Subclass => Color::from_rgb(60, 0, 110), // Darker Indigo
+            TaxaLevel::Subclass => Color::from_rgb(60, 0, 110),  // Darker Indigo
             TaxaLevel::Superorder => Color::from_rgb(255, 255, 100), // Lighter Yellow
-            TaxaLevel::Order => Color::from_rgb(255, 255, 0), // Yellow
+            TaxaLevel::Order => Color::from_rgb(255, 255, 0),    // Yellow
             TaxaLevel::Parvorder => Color::from_rgb(200, 200, 0), // Darker Yellow
             TaxaLevel::Infraorder => Color::from_rgb(200, 200, 0), // Darker Yellow
             TaxaLevel::Suborder => Color::from_rgb(200, 200, 0), // Darker Yellow
             TaxaLevel::Superfamily => Color::from_rgb(255, 215, 0), // Gold
-            TaxaLevel::Family => Color::from_rgb(255, 165, 0), // Orange
+            TaxaLevel::Family => Color::from_rgb(255, 165, 0),   // Orange
             TaxaLevel::Subfamily => Color::from_rgb(255, 140, 0), // Darker Orange
-            TaxaLevel::Tribe => Color::from_rgb(0, 0, 255), // Blue
-            TaxaLevel::Subtribe => Color::from_rgb(0, 0, 200), // Darker Blue
-            TaxaLevel::Genus => Color::from_rgb(0, 128, 0), // Green
-            TaxaLevel::Subgenus => Color::from_rgb(0, 100, 0), // Darker Green
+            TaxaLevel::Tribe => Color::from_rgb(0, 0, 255),      // Blue
+            TaxaLevel::Subtribe => Color::from_rgb(0, 0, 200),   // Darker Blue
+            TaxaLevel::Genus => Color::from_rgb(0, 128, 0),      // Green
+            TaxaLevel::Subgenus => Color::from_rgb(0, 100, 0),   // Darker Green
             TaxaLevel::SpeciesGroup => Color::from_rgb(200, 0, 0), // Darker Red
-            TaxaLevel::Species => Color::from_rgb(255, 0, 0), // Bright Red
+            TaxaLevel::Species => Color::from_rgb(255, 0, 0),    // Bright Red
             TaxaLevel::Subspecies => Color::from_rgb(200, 0, 0), // Darker Red
-            TaxaLevel::Clade => Color::from_rgb(128, 0, 128), // Purple
-            TaxaLevel::Forma => Color::from_rgb(255, 20, 147), // Deep Pink
+            TaxaLevel::Clade => Color::from_rgb(128, 0, 128),    // Purple
+            TaxaLevel::Forma => Color::from_rgb(255, 20, 147),   // Deep Pink
             TaxaLevel::Varietas => Color::from_rgb(255, 20, 147), // Deep Pink
             TaxaLevel::SpeciesSubgroup => Color::from_rgb(200, 0, 0), // Darker Red
             TaxaLevel::Subcohort => Color::from_rgb(200, 50, 0), // Darker Red-Orange
-            TaxaLevel::Cohort => Color::from_rgb(255, 69, 0), // Red-Orange
-            TaxaLevel::Section => Color::from_rgb(34, 139, 34), // Forest Green
+            TaxaLevel::Cohort => Color::from_rgb(255, 69, 0),    // Red-Orange
+            TaxaLevel::Section => Color::from_rgb(34, 139, 34),  // Forest Green
             TaxaLevel::Subsection => Color::from_rgb(34, 139, 34), // Forest Green
-            TaxaLevel::Series => Color::from_rgb(34, 139, 34), // Forest Green
+            TaxaLevel::Series => Color::from_rgb(34, 139, 34),   // Forest Green
         }
     }
-
 }
 
 pub fn build_taxonomy_graph_generator<const D: usize>(
@@ -170,12 +169,12 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
     // When a parent is 0 it means drop it, 1 is the root
     let edges: Vec<(u32, u32)> = nodes.0;
 
-    let levels: HashMap<u32, TaxaLevel> = nodes
-        .1
-        .iter()
-        .enumerate()
-        .map(|(idx, rank)| (idx as u32, TaxaLevel::from_str(rank)))
-        .collect();
+    let levels: HashMap<u32, TaxaLevel> = edges.iter().zip(nodes.1.iter()).map(
+        |((tax_id, _parent), rank)| {
+            let rank = TaxaLevel::from_str(&rank);
+            (*tax_id, rank)
+        }
+    ).collect();
 
     let levels_in_order: Vec<String> = nodes.1.iter().map(|x| x.clone()).collect();
 
@@ -187,22 +186,17 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
 
     let taxa_names: Vec<String> = names.0;
 
-    // Filter for distinct, pull from both x and y
     let nodes: Vec<u32> = edges.iter().flat_map(|(x, y)| [x, y]).copied().collect();
     let nodes = nodes.into_iter().collect::<HashSet<u32>>();
     let nodes = nodes.into_iter().collect::<Vec<u32>>();
 
-    // Dev, limit to first 1000 nodes
-    // let nodes = nodes.iter().take(1000).copied().collect::<Vec<u32>>();
-
     log::debug!("Total Edges: {}", edges.len());
 
     log::info!("Building taxonomy graph");
-    // let graph = UnGraph::<u32, (), u32>::from_edges(&edges);
-    // let graph = MatrixGraph::<u32, (), Undirected, Option<()>, u32>::from_edges(&edges);
 
     let mut graph = UnGraph::<u32, (), u32>::with_capacity(nodes.len(), nodes.len());
     let nodes: HashMap<u32, NodeIndex> = nodes.iter().map(|x| (*x, graph.add_node(1))).collect();
+    let node_indices: HashMap<NodeIndex, u32> = nodes.iter().map(|(x, y)| (*y, *x)).collect();
 
     for (x, y) in edges {
         graph.add_edge(nodes[&x], nodes[&y], ());
@@ -214,7 +208,92 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
         graph.edge_count()
     );
 
-    let (tx, rx) = bounded(8192 * 8);
+    // Iterate through all nodes and calculate how many connections there are (median, max, min)
+    let mut max = 0;
+    let mut min = std::u32::MAX;
+    let mut total = 0;
+
+    let median = graph
+        .node_indices()
+        .map(|idx| graph.neighbors(idx).count() as u32)
+        .collect::<Vec<u32>>();
+
+    // How many are over 100, 1000, 10000
+    let over_100 = median.iter().filter(|x| **x > 100).count();
+    let over_1000 = median.iter().filter(|x| **x > 1000).count();
+    let over_10000 = median.iter().filter(|x| **x > 10000).count();
+
+    // over 200, 300, 400, 500
+    let over_200 = median.iter().filter(|x| **x > 200).count();
+    let over_300 = median.iter().filter(|x| **x > 300).count();
+    let over_400 = median.iter().filter(|x| **x > 400).count();
+    let over_500 = median.iter().filter(|x| **x > 500).count();
+
+    for i in &median {
+        total += i;
+        if *i > max {
+            max = *i;
+        }
+
+        if *i < min {
+            min = *i;
+        }
+    }
+
+    let median_pos = total / median.len() as u32;
+    let median = median[median_pos as usize];
+
+    log::info!("Median: {} - Max: {} - Min: {}", median, max, min);
+    log::info!(
+        "Over 100: {} - Over 1000: {} - Over 10000: {}",
+        over_100,
+        over_1000,
+        over_10000
+    );
+
+    println!("Median: {} - Max: {} - Min: {}", median, max, min);
+    println!(
+        "Over 100: {} - Over 1000: {} - Over 10000: {}",
+        over_100, over_1000, over_10000
+    );
+    println!(
+        "Over 200: {} - Over 300: {} - Over 400: {} - Over 500: {}",
+        over_200, over_300, over_400, over_500
+    );
+
+    // Remove all from the graph that have over 200 connections
+    // todo make this smart
+    /*
+    let mut to_remove = vec![];
+
+    for idx in graph.node_indices() {
+        if graph.neighbors(idx).count() > 200 {
+            to_remove.push(idx);
+        }
+    }
+
+    for idx in to_remove {
+        graph.remove_node(idx);
+    } */
+
+    if petgraph::algo::is_cyclic_undirected(&graph) {
+        println!("Graph is cyclic");
+    }
+
+    /*
+    // Testing stuff
+    let mut neighbors = graph.neighbors(nodes[&262]).collect::<Vec<_>>();
+    println!("Neighbors of 262: {:?}", neighbors);
+    let converted_back = neighbors.iter().map(|x| node_indices[x]).collect::<Vec<_>>();
+    println!("Neighbors of 262: {:?}", converted_back);
+
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(1337);
+    let output = random_walk(&graph, &mut rng, nodes[&262], 5, vec![]);
+    println!("Random walk: {:?}", output);
+
+    panic!(); */
+
+    let (tx, rx) = bounded(8192 * 16);
 
     // Spawn threads
     let mut jhs = Vec::with_capacity(threads);
@@ -224,23 +303,26 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
     let mut shutdown = Arc::new(AtomicBool::new(false));
     let current = Arc::new(AtomicUsize::new(0));
 
+    let mut all_nodes = Arc::new(RwLock::new(Vec::new()));
+
+    all_nodes = Arc::new(RwLock::new(graph.node_indices().collect::<Vec<_>>()));
+
     for _ in 0..threads {
         let tx = tx.clone();
         let graph = Arc::clone(&graph);
-        let levels = levels.clone();
         let shutdown = Arc::clone(&shutdown);
-        let mut rng1 = rng.clone();
+        let rng1 = rng.clone();
         let current = Arc::clone(&current);
+        let all_nodes = Arc::clone(&all_nodes);
 
         let jh = std::thread::spawn(move || {
-            let len = graph.node_count();
             let mut rng = rng1;
 
             // 1/2 are nearby, 1/2 are far away as 'negative' samples
             let cutoff = (D as f32 * 0.5) as usize;
             let further = D - cutoff;
 
-            loop {
+            'outer: loop {
                 if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
@@ -248,55 +330,70 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
                 // let i = rng.gen_range(0..len) as u32;
                 // let idx = graph.node_indices().nth(i as usize).unwrap();
                 let mut idx = current.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if idx == len {
+
+                if idx >= all_nodes.read().unwrap().len() {
                     current.store(0, std::sync::atomic::Ordering::Relaxed);
+                    idx = current.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
 
-                if idx >= len {
-                    current.store(0, std::sync::atomic::Ordering::Relaxed);
-                    idx = current.fetch_add(1, std::sync::atomic::Ordering::Relaxed);                    
-                }
-
-                let idx = graph.node_indices().nth(idx as usize).unwrap();
+                let idx = all_nodes.read().unwrap()[idx];
 
                 let mut branches = [0; D];
                 let mut distances = [0; D];
 
+                let mut used = HashSet::new();
+
                 for i in 0..cutoff {
-                    let depth = rng.gen_range(1..8);
+                    let depth = rng.gen_range(1..6);
+                    let mut node = None;
 
-                    let mut current = idx;
-                    let mut current_depth = 0;
+                    let mut iters = 0;
+                    while node.is_none() {
+                        iters += 1;
 
-                    while current_depth < depth {
-                        let neighbors = graph.neighbors(current).collect::<Vec<NodeIndex>>();
-                        let next = neighbors[rng.gen_range(0..neighbors.len())];
-                        current = next;
-                        current_depth += 1;
+                        if iters > 100 {
+                            // Remove this node from the list
+                            all_nodes.write().unwrap().retain(|&x| x != idx);
+                            log::debug!("Removed node: {}", idx.index());
+                            continue 'outer;
+                        }
+
+                        node = random_walk(
+                            Arc::as_ref(&graph),
+                            &mut rng,
+                            idx,
+                            depth,
+                            vec![idx],
+                        );
                     }
+
+                    let node = node.unwrap();
 
                     // Get actual distance with astar
 
                     let distance = astar(
                         Arc::as_ref(&graph),
                         idx,
-                        |finish| finish == current,
+                        |finish| finish == node,
                         |_| 1,
                         |_| 0,
                     );
 
                     let distance = distance.unwrap().0 as u8;
 
-                    branches[i] = current.index() as u32;
+                    if node == idx {
+                        panic!("Same node");
+                    }
+
+                    used.insert(node);
+                    branches[i] = node.index() as u32;
                     distances[i] = distance as u32;
                 }
 
                 for i in cutoff..further {
                     // Pick a completely random node
-                    let end = graph
-                        .node_indices()
-                        .nth(rng.gen_range(0..len) as usize)
-                        .unwrap();
+                    let end = all_nodes.read().unwrap().choose(&mut rng).unwrap().clone();
+                        
                     let distance = astar(
                         Arc::as_ref(&graph),
                         idx,
@@ -333,8 +430,86 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
         nodes,
         colors,
         levels_in_order,
-        taxa_names, 
+        taxa_names,
     }
+}
+
+fn random_walk<R: Rng>(
+    graph: &Graph<u32, (), Undirected, u32>,
+    mut rng: &mut R,
+    start: NodeIndex,
+    depth: usize,
+    excluded_nodes: Vec<NodeIndex>,
+) -> Option<NodeIndex> {
+    let mut current_node = start;
+    let mut visited_nodes = vec![current_node];
+
+    for curdepth in 0..depth {
+        let mut neighbors: Vec<_> = graph
+            .neighbors(current_node)
+            .filter(|&n| !visited_nodes.contains(&n))
+            .collect();
+
+        if neighbors.is_empty() {
+            if start != current_node {
+                return Some(current_node);
+            } else {
+                return None;
+            }
+        }
+
+        neighbors = neighbors
+            .into_iter()
+            .filter(|x| !excluded_nodes.contains(x))
+            .collect();
+
+        if neighbors.is_empty() {
+            if start != current_node {
+                return Some(current_node);
+            } else {
+                return None;
+            }
+        }
+
+        let mut neighbors_neighbor_count = neighbors
+            .iter()
+            .map(|x| graph.neighbors(*x).count())
+            .collect::<Vec<_>>();
+
+        if curdepth < depth - 1 {
+            // Means we have more than one level to go, so try to avoid dead ends
+            // Filter neighbors that have more than 1 neighbor
+            // And filter neighbor counts to use as weights
+            neighbors = neighbors_neighbor_count
+                .iter()
+                .enumerate()
+                .filter(|(_, x)| **x > 1)
+                .map(|(i, _)| neighbors[i])
+                .collect();
+
+            neighbors_neighbor_count = neighbors_neighbor_count
+                .into_iter()
+                .filter(|x| *x > 1)
+                .collect();            
+        }
+
+        if neighbors.is_empty() {
+            if start != current_node {
+                return Some(current_node);
+            } else {
+                return None;
+            }
+        }
+
+        let dist = WeightedIndex::new(neighbors_neighbor_count).unwrap();
+
+        let next_node = neighbors[dist.sample(&mut rng)];
+        visited_nodes.push(next_node);
+        current_node = next_node;
+    }
+    
+
+    Some(current_node)
 }
 
 pub struct BatchGenerator<const D: usize> {
