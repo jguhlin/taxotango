@@ -42,19 +42,21 @@ impl PoincareDistance {
     }
 
     pub fn forward<B: Backend>(&self, x: Tensor<B, 3>, y: Tensor<B, 3>) -> Tensor<B, 2> {
-        let x_norm = self.l2_norm.forward(x.clone()).clamp(1e-5, 1.0 - 1e-5);
-        let y_norm = self.l2_norm.forward(y.clone()).clamp(1e-5, 1.0 - 1e-5);
+        let x_norm = self.l2_norm.forward(x.clone());
+        let y_norm = self.l2_norm.forward(y.clone());
 
         let diff_norm = self.l2_norm.forward(x - y).powf_scalar(2.0);
 
         let num = diff_norm * 2.0;
-        let num = num.add_scalar(1e-7);
+        let num = num.add_scalar(1e-12);
         let ones = Tensor::<B, 3>::ones_like(&x_norm);
         let denom = (ones.clone() - x_norm.clone().powf_scalar(2.0))
             * (ones - y_norm.clone().powf_scalar(2.0));
-        let denom = denom.add_scalar(1e-7);
+        let denom = denom.add_scalar(1e-12);
 
         let distance = num / denom;
+
+        let distance = distance.clamp(1e-12, f32::MAX);
 
         let distance = distance.squeeze(2);
 
@@ -72,7 +74,7 @@ impl L2Norm {
 
     pub fn forward<B: Backend, const N: usize>(&self, x: Tensor<B, N>) -> Tensor<B, N> {
         // Because you can't take the sqrt of
-        x.powf_scalar(2.0).sum_dim(N - 1).add_scalar(1e-7).sqrt()
+        x.powf_scalar(2.0).sum_dim(N - 1).sqrt().clamp(1e-12, f32::MAX)
     }
 }
 
@@ -92,8 +94,8 @@ impl PoincareTaxonomyEmbeddingModelConfig {
     /// Initializes a model with default weights
     pub fn init<B: Backend>(&self, device: &B::Device) -> PoincareTaxonomyEmbeddingModel<B> {
         let initializer = burn::nn::Initializer::Uniform {
-            min: -0.45,
-            max: 0.45,
+            min: -0.1,
+            max: 0.1,
         };
 
         //let layer_norm = LayerNormConfig::new(self.embedding_size)
