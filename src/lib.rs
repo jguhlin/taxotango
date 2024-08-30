@@ -378,8 +378,9 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
                         |_| 1,
                         |_| 0,
                     );
+                    // let distance = bfs_distance(Arc::as_ref(&graph), idx, node);
 
-                    let distance = distance.unwrap().0 as u8;
+                    let distance = distance.unwrap().0 as u32;
 
                     if node == idx {
                         panic!("Same node");
@@ -387,13 +388,15 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
 
                     used.insert(node);
                     branches[i] = node.index() as u32;
-                    distances[i] = distance as u32;
+                    distances[i] = distance;
                 }
 
                 for i in cutoff..further {
                     // Pick a completely random node
                     let end = all_nodes.read().unwrap().choose(&mut rng).unwrap().clone();
                         
+                    // let distance = dfs_distance(Arc::as_ref(&graph), idx, end);
+
                     let distance = astar(
                         Arc::as_ref(&graph),
                         idx,
@@ -436,7 +439,7 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
 
 fn random_walk<R: Rng>(
     graph: &Graph<u32, (), Undirected, u32>,
-    mut rng: &mut R,
+    rng: &mut R,
     start: NodeIndex,
     depth: usize,
     excluded_nodes: Vec<NodeIndex>,
@@ -471,15 +474,18 @@ fn random_walk<R: Rng>(
             }
         }
 
-        let mut neighbors_neighbor_count = neighbors
+/*        let mut neighbors_neighbor_count = neighbors
             .iter()
             .map(|x| graph.neighbors(*x).count())
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>(); */
 
-        if curdepth < depth - 1 {
+        // if curdepth < depth - 1 {
             // Means we have more than one level to go, so try to avoid dead ends
             // Filter neighbors that have more than 1 neighbor
             // And filter neighbor counts to use as weights
+            
+            
+            /*
             neighbors = neighbors_neighbor_count
                 .iter()
                 .enumerate()
@@ -490,8 +496,9 @@ fn random_walk<R: Rng>(
             neighbors_neighbor_count = neighbors_neighbor_count
                 .into_iter()
                 .filter(|x| *x > 1)
-                .collect();            
-        }
+                .collect();
+            */
+        // }
 
         if neighbors.is_empty() {
             if start != current_node {
@@ -501,15 +508,92 @@ fn random_walk<R: Rng>(
             }
         }
 
-        let dist = WeightedIndex::new(neighbors_neighbor_count).unwrap();
+        // let dist = WeightedIndex::new(neighbors_neighbor_count).unwrap();
 
-        let next_node = neighbors[dist.sample(&mut rng)];
-        visited_nodes.push(next_node);
-        current_node = next_node;
+        // let next_node = neighbors[dist.sample(&mut rng)];
+
+        let mut next_node = rng.gen_range(0..neighbors.len());
+        while curdepth < depth - 1 && graph.neighbors(neighbors[next_node]).count() == 1 {
+
+            if neighbors.len() == 1 {
+                current_node = neighbors[next_node];
+                if start != current_node {
+                    return Some(current_node);
+                } else {
+                    return None;
+                }
+            }
+
+            // Remove from neighbors
+            neighbors.remove(next_node);
+
+            next_node = rng.gen_range(0..neighbors.len());
+        }
+
+        visited_nodes.push(neighbors[next_node]);
+        current_node = neighbors[next_node];
     }
     
 
     Some(current_node)
+}
+
+fn bfs_distance(
+    graph: &Graph<u32, (), Undirected, u32>,
+    start: NodeIndex,
+    end: NodeIndex,
+) -> Option<usize> {
+    // Initialize BFS
+    let mut bfs = Bfs::new(graph, start);
+    let mut distances = vec![None; graph.node_count()];
+    distances[start.index()] = Some(0);
+
+    // Perform BFS
+    while let Some(node) = bfs.next(graph) {
+        let current_distance = distances[node.index()].unwrap();
+
+        if node == end {
+            return Some(current_distance);
+        }
+
+        for neighbor in graph.neighbors(node) {
+            if distances[neighbor.index()].is_none() {
+                distances[neighbor.index()] = Some(current_distance + 1);
+            }
+        }
+    }
+
+    // If we finish BFS without finding the target node, return None
+    None
+}
+
+fn dfs_distance(
+    graph: &Graph<u32, (), Undirected, u32>,
+    start: NodeIndex,
+    end: NodeIndex,
+) -> Option<usize> {
+    // Initialize BFS
+    let mut bfs = Dfs::new(graph, start);
+    let mut distances = vec![None; graph.node_count()];
+    distances[start.index()] = Some(0);
+
+    // Perform DFS
+    while let Some(node) = bfs.next(graph) {
+        let current_distance = distances[node.index()].unwrap();
+
+        if node == end {
+            return Some(current_distance);
+        }
+
+        for neighbor in graph.neighbors(node) {
+            if distances[neighbor.index()].is_none() {
+                distances[neighbor.index()] = Some(current_distance + 1);
+            }
+        }        
+    }
+
+    // If we finish BFS without finding the target node, return None
+    None
 }
 
 pub struct BatchGenerator<const D: usize> {
@@ -598,7 +682,6 @@ impl<const D: usize> BatchGenerator<D> {
     */
 
     pub fn valid(&self) -> Self {
-        let rng = Xoshiro256PlusPlus::seed_from_u64(13371337);
         BatchGenerator {
             graph: Arc::clone(&self.graph),
             epoch_size: 2048,

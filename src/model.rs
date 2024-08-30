@@ -73,8 +73,8 @@ impl L2Norm {
     }
 
     pub fn forward<B: Backend, const N: usize>(&self, x: Tensor<B, N>) -> Tensor<B, N> {
-        // Because you can't take the sqrt of
-        x.powf_scalar(2.0).sum_dim(N - 1).sqrt().clamp(1e-12, f32::MAX)
+        // Because you can't take the sqrt of 0
+        x.powf_scalar(2.0).sum_dim(N - 1).clamp(1e-12, f32::MAX).sqrt()
     }
 }
 
@@ -94,8 +94,8 @@ impl PoincareTaxonomyEmbeddingModelConfig {
     /// Initializes a model with default weights
     pub fn init<B: Backend>(&self, device: &B::Device) -> PoincareTaxonomyEmbeddingModel<B> {
         let initializer = burn::nn::Initializer::Uniform {
-            min: -0.1,
-            max: 0.1,
+            min: -0.05,
+            max: 0.05,
         };
 
         //let layer_norm = LayerNormConfig::new(self.embedding_size)
@@ -251,7 +251,7 @@ impl<B: Backend> ValidStep<TangoBatch<B>, RegressionOutput<B>>
 fn acosh<B: Backend, const D: usize>(x: Tensor<B, D>) -> Tensor<B, D> {
     let x = x.clamp_min(1.0);
     let x_squared = x.clone().powf_scalar(2.0);
-    let inside_sqrt = x_squared.sub_scalar(1.0);
+    let inside_sqrt = x_squared.sub_scalar(1.0).clamp_min(1e-12);
     let sqrt_term = inside_sqrt.sqrt();
     (x + sqrt_term).log()
 }
@@ -324,7 +324,7 @@ pub fn train<const D: usize, B: AutodiffBackend>(
         .build(
             config.model.init::<B>(&device),
             config.optimizer.init(),
-            burn::lr_scheduler::linear::LinearLrSchedulerConfig::new(5e-3, 1e-6, 100_000).init(),
+            burn::lr_scheduler::linear::LinearLrSchedulerConfig::new(4e-3, 1e-6, 10_000).init(),
         );
 
     log::trace!("Learner built");
