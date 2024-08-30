@@ -22,7 +22,7 @@ use taxotangolib::*;
 
 fn main() {
     let debug = false;
-    let infer = true;
+    let infer = false;
     let view = false;
     let custom = false;
 
