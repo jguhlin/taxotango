@@ -1,7 +1,7 @@
-// use mimalloc::MiMalloc;
+use mimalloc::MiMalloc;
 
-// #[global_allocator]
-// static GLOBAL: MiMalloc = MiMalloc;
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use burn::backend::{autodiff::Autodiff, libtorch::LibTorchDevice, LibTorch, Wgpu};
 use burn::data::dataloader::batcher::Batcher;
 use burn::data::dataset::Dataset;
-use burn::optim::AdamWConfig;
+use burn::optim::{AdamWConfig, SgdConfig};
 use burn::prelude::*;
 use burn::record::{CompactRecorder, Recorder};
 use burn::tensor::Tensor;
@@ -118,7 +118,7 @@ fn main() {
     let nodes_file = "/mnt/data/data/nt/taxdmp/nodes.dmp";
     let names_file = "/mnt/data/data/nt/taxdmp/names.dmp";
 
-    let mut generator = build_taxonomy_graph_generator(nodes_file, names_file, 52); 
+    let mut generator = build_taxonomy_graph_generator(nodes_file, names_file, 58);
 
     let config = PoincareTaxonomyEmbeddingModelConfig {
         taxonomy_size: generator.taxonomy_size(),
@@ -163,48 +163,19 @@ fn main() {
         println!("{}", output);
         generator.shutdown();
     } else {
-        let adamwconfig = AdamWConfig::new();
+        let optim = AdamWConfig::new();
         // .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(1.0)));
+
+        // let optim = crate::model::RiemannianSgdConfig::new();
+        // let optim = SgdConfig::new();
 
         crate::model::train::<4, MyAutodiffBackend>(
             "/mnt/data/data/taxontango_training",
-            crate::model::TrainingConfig::new(config, adamwconfig),
+            crate::model::TrainingConfig::new(config, optim),
             generator,
             device,
         );
 
         // crate::model::custom_training_loop::<MyAutodiffBackend>(generator, &device);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_batcher() {
-        let generator = BatchGenerator::testing();
-
-        let config = PoincareTaxonomyEmbeddingModelConfig {
-            taxonomy_size: generator.taxonomy_size(),
-            embedding_size: 3,
-        };
-
-        type MyBackend = Wgpu<f32, i32>;
-
-        let device = burn::backend::wgpu::WgpuDevice::default();
-
-        let model = config.init::<MyBackend>(&device);
-
-        let tb = TangoBatcher::new(device);
-        let batch = tb.batch(
-            (0..10)
-                .map(|i| generator.get(i).unwrap())
-                .collect::<Vec<_>>(),
-        );
-
-        let output = model.forward(batch.origins, batch.branches);
-        // println!("{:#?}", output);
-        println!("{}", output);
     }
 }

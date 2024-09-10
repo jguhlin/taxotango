@@ -1,24 +1,31 @@
+use bumpalo::Bump;
 use burn::data::dataset::{Dataset, DatasetIterator};
+use crossbeam::channel::bounded;
 use petgraph::adj::NodeIndices;
 use petgraph::algo::astar;
-use petgraph::prelude::*;
-use crossbeam::channel::bounded;
 use petgraph::graph::{NodeIndex, UnGraph};
+use petgraph::prelude::*;
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 use rand::seq::SliceRandom;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use rerun::Color;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
+use fnv::FnvHashMap as HashMap;
+use fnv::FnvHashSet as HashSet;
+
 pub mod model;
 pub use model::*;
+
+pub mod layers;
+pub use layers::*;
 
 pub enum TaxonomyWriterMessage {
     Write(Vec<(NodeIndex, NodeIndex, u8)>),
@@ -150,12 +157,18 @@ impl TaxaLevel {
     }
 }
 
-pub fn build_taxonomy_graph_generator<const D: usize>(
+pub fn build_taxonomy_graph(
     nodes_file: &str,
     names_file: &str,
-    threads: usize,
-) -> BatchGenerator<D> {
-    // acc2tax todo: change it so we are passing &str
+) -> (
+    petgraph::Graph<u32, (), petgraph::Undirected>,
+    HashMap<NodeIndex, u32>,
+    Vec<String>,
+    HashMap<u32, TaxaLevel>,
+    Vec<String>,
+    HashMap<u32, NodeIndex>,
+    Vec<Color>,
+) {
     let names = parse_names(names_file.to_string());
     let nodes = parse_nodes(nodes_file.to_string());
 
@@ -169,12 +182,14 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
     // When a parent is 0 it means drop it, 1 is the root
     let edges: Vec<(u32, u32)> = nodes.0;
 
-    let levels: HashMap<u32, TaxaLevel> = edges.iter().zip(nodes.1.iter()).map(
-        |((tax_id, _parent), rank)| {
+    let levels: HashMap<u32, TaxaLevel> = edges
+        .iter()
+        .zip(nodes.1.iter())
+        .map(|((tax_id, _parent), rank)| {
             let rank = TaxaLevel::from_str(&rank);
             (*tax_id, rank)
-        }
-    ).collect();
+        })
+        .collect();
 
     let levels_in_order: Vec<String> = nodes.1.iter().map(|x| x.clone()).collect();
 
@@ -202,98 +217,104 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
         graph.add_edge(nodes[&x], nodes[&y], ());
     }
 
+    // Remove any that have no neighbors
+    let mut removed = 0;
+    for (i, ni) in nodes.iter() {
+        let neighbors = graph.neighbors(*ni);
+        if neighbors.count() == 0 {
+            graph.remove_node(*ni);
+            removed += 1;
+        }
+    }
+
+    log::info!("Removed {} nodes with no neighbors", removed);
+
+    // Rebuild nodes and node_indices
+    let nodes = graph
+        .node_indices()
+        .map(|x| (node_indices[&x], x))
+        .collect::<HashMap<_, _>>();
+    let node_indices = nodes
+        .iter()
+        .map(|(x, y)| (*y, *x))
+        .collect::<HashMap<_, _>>();
+
     log::info!(
         "Taxonomy graph built. Node Count: {} - Edge Count: {}",
         graph.node_count(),
         graph.edge_count()
     );
 
-    // Iterate through all nodes and calculate how many connections there are (median, max, min)
-    let mut max = 0;
-    let mut min = std::u32::MAX;
-    let mut total = 0;
+    (
+        graph,
+        node_indices,
+        taxa_names,
+        levels,
+        levels_in_order,
+        nodes,
+        colors,
+    )
+}
 
-    let median = graph
-        .node_indices()
-        .map(|idx| graph.neighbors(idx).count() as u32)
-        .collect::<Vec<u32>>();
+// Store the taxa dist training element from each node in the graph, and update when given an new element
+// Allows for training to continue even if new data is not yet ready
+pub struct TaxaDistCache<const D: usize> {
+    pub cache: Arc<RwLock<Vec<TaxaDistance<D>>>>,
+    pub last_used: Arc<AtomicUsize>,
+}
 
-    // How many are over 100, 1000, 10000
-    let over_100 = median.iter().filter(|x| **x > 100).count();
-    let over_1000 = median.iter().filter(|x| **x > 1000).count();
-    let over_10000 = median.iter().filter(|x| **x > 10000).count();
-
-    // over 200, 300, 400, 500
-    let over_200 = median.iter().filter(|x| **x > 200).count();
-    let over_300 = median.iter().filter(|x| **x > 300).count();
-    let over_400 = median.iter().filter(|x| **x > 400).count();
-    let over_500 = median.iter().filter(|x| **x > 500).count();
-
-    for i in &median {
-        total += i;
-        if *i > max {
-            max = *i;
-        }
-
-        if *i < min {
-            min = *i;
+impl<const D: usize> TaxaDistCache<D> {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            cache: Arc::new(RwLock::new(Vec::with_capacity(capacity))),
+            last_used: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    let median_pos = total / median.len() as u32;
-    let median = median[median_pos as usize];
-
-    log::info!("Median: {} - Max: {} - Min: {}", median, max, min);
-    log::info!(
-        "Over 100: {} - Over 1000: {} - Over 10000: {}",
-        over_100,
-        over_1000,
-        over_10000
-    );
-
-    println!("Median: {} - Max: {} - Min: {}", median, max, min);
-    println!(
-        "Over 100: {} - Over 1000: {} - Over 10000: {}",
-        over_100, over_1000, over_10000
-    );
-    println!(
-        "Over 200: {} - Over 300: {} - Over 400: {} - Over 500: {}",
-        over_200, over_300, over_400, over_500
-    );
-
-    // Remove all from the graph that have over 200 connections
-    // todo make this smart
-    /*
-    let mut to_remove = vec![];
-
-    for idx in graph.node_indices() {
-        if graph.neighbors(idx).count() > 200 {
-            to_remove.push(idx);
+    pub fn update(&self, i: usize, element: TaxaDistance<D>) {
+        let mut cache = self.cache.write().unwrap();
+        if cache.len() <= i {
+            cache.resize(i + 1, element);
+        } else {
+            cache[i] = element;
         }
     }
 
-    for idx in to_remove {
-        graph.remove_node(idx);
-    } */
-
-    if petgraph::algo::is_cyclic_undirected(&graph) {
-        println!("Graph is cyclic");
+    pub fn len(&self) -> usize {
+        self.cache.read().unwrap().len()
     }
 
-    /*
-    // Testing stuff
-    let mut neighbors = graph.neighbors(nodes[&262]).collect::<Vec<_>>();
-    println!("Neighbors of 262: {:?}", neighbors);
-    let converted_back = neighbors.iter().map(|x| node_indices[x]).collect::<Vec<_>>();
-    println!("Neighbors of 262: {:?}", converted_back);
+    pub fn get(&self, i: usize) -> TaxaDistance<D> {
+        let cache = self.cache.read().unwrap();
 
-    let mut rng = Xoshiro256PlusPlus::seed_from_u64(1337);
-    let output = random_walk(&graph, &mut rng, nodes[&262], 5, vec![]);
-    println!("Random walk: {:?}", output);
+        if i >= cache.len() {
+            if self.last_used.load(std::sync::atomic::Ordering::Relaxed) >= cache.len() {
+                self.last_used
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+            }
 
-    panic!(); */
+            cache[self
+                .last_used
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)]
+            .clone()
+        } else {
+            cache[i].clone()
+        }
+    }
+}
 
-    let (tx, rx) = bounded(8192 * 16);
+pub fn build_taxonomy_graph_generator<const D: usize>(
+    nodes_file: &str,
+    names_file: &str,
+    threads: usize,
+) -> BatchGenerator<D> {
+    let (graph, node_indices, taxa_names, levels, levels_in_order, nodes, colors) =
+        build_taxonomy_graph(nodes_file, names_file);
+
+    let (tx, rx) = bounded(threads * 2);
+
+    let taxa_dist_cache: Arc<TaxaDistCache<D>> =
+        Arc::new(TaxaDistCache::with_capacity(graph.node_count()));
 
     // Spawn threads
     let mut jhs = Vec::with_capacity(threads);
@@ -307,120 +328,122 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
 
     all_nodes = Arc::new(RwLock::new(graph.node_indices().collect::<Vec<_>>()));
 
-    for _ in 0..threads {
+    for threadno in 0..threads {
         let tx = tx.clone();
         let graph = Arc::clone(&graph);
         let shutdown = Arc::clone(&shutdown);
-        let rng1 = rng.clone();
+        rng.long_jump();
+        let mut rng = rng.clone();
         let current = Arc::clone(&current);
         let all_nodes = Arc::clone(&all_nodes);
+        let taxa_dist_cache = Arc::clone(&taxa_dist_cache);
 
         let jh = std::thread::spawn(move || {
-            let mut rng = rng1;
+            let mut local_excluded = HashSet::default();
+            let mut branches = [0; D];
+            let mut distances = [0; D];
+            let mut depths = vec![None; graph.node_count()];
 
-            // 1/2 are nearby, 1/2 are far away as 'negative' samples
-            let cutoff = (D as f32 * 0.5) as usize;
-            let further = D - cutoff;
-
-            'outer: loop {
+            loop {
                 if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
 
-                // let i = rng.gen_range(0..len) as u32;
-                // let idx = graph.node_indices().nth(i as usize).unwrap();
-                let mut idx = current.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let idx = loop {
+                    let i = current.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= all_nodes.read().unwrap().len() {
+                        current.store(0, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                    break all_nodes.read().unwrap()[i];
+                };
 
-                if idx >= all_nodes.read().unwrap().len() {
-                    current.store(0, std::sync::atomic::Ordering::Relaxed);
-                    idx = current.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
+                local_excluded.clear();
+                local_excluded.insert(idx);
 
-                let idx = all_nodes.read().unwrap()[idx];
+                // Nearby samples
+                for i in 0..D / 2 {
+                    let mut depth = rng.gen_range(1..6);
 
-                let mut branches = [0; D];
-                let mut distances = [0; D];
-
-                let mut used = HashSet::new();
-
-                for i in 0..cutoff {
-                    let depth = rng.gen_range(1..6);
                     let mut node = None;
-
-                    let mut iters = 0;
+                    let mut tries = 0;
                     while node.is_none() {
-                        iters += 1;
-
-                        if iters > 100 {
-                            // Remove this node from the list
-                            all_nodes.write().unwrap().retain(|&x| x != idx);
-                            log::debug!("Removed node: {}", idx.index());
-                            continue 'outer;
+                        if tries > 10 {
+                            depth += 1;
                         }
 
-                        node = random_walk(
+                        if tries > 1000 {
+                            log::debug!("Node {} has no neighbors", idx.index());
+                            break;
+                        }
+
+                        tries += 1;
+                        node = random_walk_bfs(
                             Arc::as_ref(&graph),
                             &mut rng,
                             idx,
                             depth,
-                            vec![idx],
+                            &local_excluded,
+                            &mut depths,
                         );
+                        depths.iter_mut().for_each(|x| *x = None);
                     }
 
                     let node = node.unwrap();
 
-                    // Get actual distance with astar
+                    local_excluded.insert(node.0);
+                    branches[i] = node.0.index() as u32;
+                    distances[i] = node.1;
+                }
 
-                    let distance = astar(
-                        Arc::as_ref(&graph),
-                        idx,
-                        |finish| finish == node,
-                        |_| 1,
-                        |_| 0,
-                    );
-                    // let distance = bfs_distance(Arc::as_ref(&graph), idx, node);
-
-                    let distance = distance.unwrap().0 as u32;
-
-                    if node == idx {
-                        panic!("Same node");
+                // Far away samples
+                let all_nodes_read = all_nodes.read().unwrap();
+                for i in D / 2..D {
+                    let end = *all_nodes_read.choose(&mut rng).unwrap();
+                    if let Some(distance) = dfs_distance_alt(Arc::as_ref(&graph), idx, end) {
+                        branches[i] = end.index() as u32;
+                        distances[i] = distance as u32;
+                    } else {
+                        // If path not found, try another random node
+                        continue;
                     }
-
-                    used.insert(node);
-                    branches[i] = node.index() as u32;
-                    distances[i] = distance;
                 }
 
-                for i in cutoff..further {
-                    // Pick a completely random node
-                    let end = all_nodes.read().unwrap().choose(&mut rng).unwrap().clone();
-                        
-                    // let distance = dfs_distance(Arc::as_ref(&graph), idx, end);
-
-                    let distance = astar(
-                        Arc::as_ref(&graph),
-                        idx,
-                        |finish| finish == end,
-                        |_| 1,
-                        |_| 0,
+                // None of the distances should be 0
+                if distances.iter().any(|&x| x == 0) {
+                    // If so, show all branches and distances, and the origin
+                    log::debug!(
+                        "Branches: {:?}, Distances: {:?}, Origin: {}",
+                        branches,
+                        distances,
+                        idx.index()
                     );
-
-                    // let (node, depth) = self.random_walk(idx, depth);
-                    branches[i] = end.index() as u32;
-                    distances[i] = distance.unwrap().0 as u32;
+                    panic!();
                 }
 
-                tx.send(TaxaDistance {
+                let taxa_dist = TaxaDistance {
                     origin: idx.index() as u32,
                     branches,
                     distances,
-                })
-                .unwrap();
+                };
+
+                taxa_dist_cache.update(idx.index(), taxa_dist.clone());
             }
         });
 
-        rng.long_jump();
         jhs.push(jh);
+    }
+
+    let cache_warmup_size = graph.node_count() / 10;
+    let cache_warmup_size = 8192;
+
+    while taxa_dist_cache.len() < cache_warmup_size {
+        println!(
+            "Waiting for cache to fill: {}/{}",
+            taxa_dist_cache.len(),
+            cache_warmup_size
+        );
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
 
     BatchGenerator {
@@ -434,6 +457,47 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
         colors,
         levels_in_order,
         taxa_names,
+        taxa_dist_cache,
+    }
+}
+
+fn random_walk_bfs<R: Rng>(
+    graph: &Graph<u32, (), petgraph::Undirected, u32>,
+    rng: &mut R,
+    start: NodeIndex,
+    depth: usize,
+    excluded_nodes: &HashSet<NodeIndex>,
+    depths: &mut Vec<Option<usize>>,
+) -> Option<(NodeIndex, u32)> {
+    let mut bfs = Bfs::new(graph, start);
+    let mut current_depth;
+
+    depths[start.index()] = Some(0);
+
+    let mut candidates = Vec::new();
+
+    while let Some(node) = bfs.next(graph) {
+        current_depth = depths[node.index()].unwrap_or(0);
+
+        // Stop early once we have passed the desired depth
+        if current_depth > depth {
+            break;
+        }
+
+        for neighbor in graph.neighbors(node) {
+            if depths[neighbor.index()].is_none() {
+                depths[neighbor.index()] = Some(current_depth + 1);
+                if current_depth + 1 == depth && !excluded_nodes.contains(&neighbor) {
+                    candidates.push((neighbor, (current_depth + 1) as u32));
+                }
+            }
+        }
+    }
+
+    if !candidates.is_empty() {
+        Some(*candidates.choose(rng).unwrap())
+    } else {
+        None
     }
 }
 
@@ -442,20 +506,24 @@ fn random_walk<R: Rng>(
     rng: &mut R,
     start: NodeIndex,
     depth: usize,
-    excluded_nodes: Vec<NodeIndex>,
-) -> Option<NodeIndex> {
+    excluded_nodes: &HashSet<NodeIndex>,
+) -> Option<(NodeIndex, u32)> {
     let mut current_node = start;
     let mut visited_nodes = vec![current_node];
 
-    for curdepth in 0..depth {
+    for curdepth in 1..depth {
         let mut neighbors: Vec<_> = graph
             .neighbors(current_node)
             .filter(|&n| !visited_nodes.contains(&n))
             .collect();
 
+        if depth == 1 && neighbors.is_empty() {
+            log::debug!("Node {} has no neighbors", current_node.index());
+        }
+
         if neighbors.is_empty() {
             if start != current_node {
-                return Some(current_node);
+                return Some((current_node, curdepth as u32));
             } else {
                 return None;
             }
@@ -468,41 +536,40 @@ fn random_walk<R: Rng>(
 
         if neighbors.is_empty() {
             if start != current_node {
-                return Some(current_node);
+                return Some((current_node, curdepth as u32));
             } else {
                 return None;
             }
         }
 
-/*        let mut neighbors_neighbor_count = neighbors
-            .iter()
-            .map(|x| graph.neighbors(*x).count())
-            .collect::<Vec<_>>(); */
+        /*        let mut neighbors_neighbor_count = neighbors
+        .iter()
+        .map(|x| graph.neighbors(*x).count())
+        .collect::<Vec<_>>(); */
 
         // if curdepth < depth - 1 {
-            // Means we have more than one level to go, so try to avoid dead ends
-            // Filter neighbors that have more than 1 neighbor
-            // And filter neighbor counts to use as weights
-            
-            
-            /*
-            neighbors = neighbors_neighbor_count
-                .iter()
-                .enumerate()
-                .filter(|(_, x)| **x > 1)
-                .map(|(i, _)| neighbors[i])
-                .collect();
+        // Means we have more than one level to go, so try to avoid dead ends
+        // Filter neighbors that have more than 1 neighbor
+        // And filter neighbor counts to use as weights
 
-            neighbors_neighbor_count = neighbors_neighbor_count
-                .into_iter()
-                .filter(|x| *x > 1)
-                .collect();
-            */
+        /*
+        neighbors = neighbors_neighbor_count
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| **x > 1)
+            .map(|(i, _)| neighbors[i])
+            .collect();
+
+        neighbors_neighbor_count = neighbors_neighbor_count
+            .into_iter()
+            .filter(|x| *x > 1)
+            .collect();
+        */
         // }
 
         if neighbors.is_empty() {
             if start != current_node {
-                return Some(current_node);
+                return Some((current_node, curdepth as u32));
             } else {
                 return None;
             }
@@ -514,11 +581,10 @@ fn random_walk<R: Rng>(
 
         let mut next_node = rng.gen_range(0..neighbors.len());
         while curdepth < depth - 1 && graph.neighbors(neighbors[next_node]).count() == 1 {
-
             if neighbors.len() == 1 {
                 current_node = neighbors[next_node];
                 if start != current_node {
-                    return Some(current_node);
+                    return Some((current_node, curdepth as u32));
                 } else {
                     return None;
                 }
@@ -533,9 +599,40 @@ fn random_walk<R: Rng>(
         visited_nodes.push(neighbors[next_node]);
         current_node = neighbors[next_node];
     }
-    
 
-    Some(current_node)
+    Some((current_node, depth as u32))
+}
+
+fn random_walk_alt<R: Rng>(
+    graph: &Graph<u32, (), Undirected, u32>,
+    rng: &mut R,
+    start: NodeIndex,
+    depth: usize,
+    excluded_nodes: &HashSet<NodeIndex>,
+) -> Option<(NodeIndex, u32)> {
+    let mut current_node = start;
+    let mut visited_nodes = HashSet::default();
+    visited_nodes.insert(current_node);
+
+    for current_depth in 0..depth {
+        let neighbors: Vec<_> = graph
+            .neighbors(current_node)
+            .filter(|&n| !visited_nodes.contains(&n) && !excluded_nodes.contains(&n))
+            .collect();
+
+        if neighbors.is_empty() {
+            return if current_node != start {
+                Some((current_node, current_depth as u32))
+            } else {
+                None
+            };
+        }
+
+        current_node = *neighbors.choose(rng).unwrap();
+        visited_nodes.insert(current_node);
+    }
+
+    Some((current_node, depth as u32))
 }
 
 fn bfs_distance(
@@ -567,6 +664,39 @@ fn bfs_distance(
     None
 }
 
+fn bfs_distance_alt(
+    graph: &Graph<u32, (), Undirected, u32>,
+    start: NodeIndex,
+    end: NodeIndex,
+    max_depth: Option<usize>,
+) -> Option<usize> {
+    let mut queue = VecDeque::new();
+    let mut visited = HashSet::default();
+
+    queue.push_back((start, 0));
+    visited.insert(start);
+
+    while let Some((node, distance)) = queue.pop_front() {
+        if node == end {
+            return Some(distance);
+        }
+
+        if let Some(max) = max_depth {
+            if distance >= max {
+                continue;
+            }
+        }
+
+        for neighbor in graph.neighbors(node) {
+            if visited.insert(neighbor) {
+                queue.push_back((neighbor, distance + 1));
+            }
+        }
+    }
+
+    None
+}
+
 fn dfs_distance(
     graph: &Graph<u32, (), Undirected, u32>,
     start: NodeIndex,
@@ -589,10 +719,35 @@ fn dfs_distance(
             if distances[neighbor.index()].is_none() {
                 distances[neighbor.index()] = Some(current_distance + 1);
             }
-        }        
+        }
     }
 
-    // If we finish BFS without finding the target node, return None
+    // If we finish DFS without finding the target node, return None
+    None
+}
+
+fn dfs_distance_alt(
+    graph: &Graph<u32, (), Undirected, u32>,
+    start: NodeIndex,
+    end: NodeIndex,
+) -> Option<usize> {
+    let mut queue = VecDeque::new();
+    let mut visited = HashSet::default();
+    queue.push_back((start, 0));
+    visited.insert(start);
+
+    while let Some((node, distance)) = queue.pop_front() {
+        if node == end {
+            return Some(distance);
+        }
+
+        for neighbor in graph.neighbors(node) {
+            if visited.insert(neighbor) {
+                queue.push_back((neighbor, distance + 1));
+            }
+        }
+    }
+
     None
 }
 
@@ -607,16 +762,17 @@ pub struct BatchGenerator<const D: usize> {
     pub colors: Vec<Color>,
     pub levels_in_order: Vec<String>,
     pub taxa_names: Vec<String>,
+    pub taxa_dist_cache: Arc<TaxaDistCache<D>>,
 }
 
 impl<const D: usize> Dataset<TaxaDistance<D>> for BatchGenerator<D> {
     fn len(&self) -> usize {
-        // Batch size of 1024
         self.epoch_size
     }
 
-    fn get(&self, _index: usize) -> Option<TaxaDistance<D>> {
-        self.receiver.recv().ok()
+    fn get(&self, index: usize) -> Option<TaxaDistance<D>> {
+        // self.receiver.recv().ok()
+        self.taxa_dist_cache.get(index).into()
     }
 
     // Provided methods
@@ -693,6 +849,7 @@ impl<const D: usize> BatchGenerator<D> {
             colors: self.colors.clone(),
             levels_in_order: self.levels_in_order.clone(),
             taxa_names: self.taxa_names.clone(),
+            taxa_dist_cache: Arc::clone(&self.taxa_dist_cache),
         }
     }
 
@@ -736,7 +893,7 @@ pub fn parse_names(filename: String) -> (Vec<String>, Vec<u32>) {
     let reader = BufReader::new(File::open(filename).expect("Unable to open taxonomy names file"));
 
     let lines = reader.lines();
-    let mut taxids = HashSet::new();
+    let mut taxids = HashSet::default();
 
     for line in lines {
         let split = line
