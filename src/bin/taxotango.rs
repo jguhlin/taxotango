@@ -24,7 +24,7 @@ fn main() {
     let debug = false;
     let infer = false;
     let view = false;
-    let custom = false;
+    let custom = true;
 
     if view {
         let rec = rerun::RecordingStreamBuilder::new("rerun_embeddings")
@@ -118,11 +118,11 @@ fn main() {
     let nodes_file = "/mnt/data/data/nt/taxdmp/nodes.dmp";
     let names_file = "/mnt/data/data/nt/taxdmp/names.dmp";
 
-    let mut generator = build_taxonomy_graph_generator(nodes_file, names_file, 58);
+    let mut generator = build_taxonomy_graph_generator(nodes_file, names_file, 18);
 
     let config = PoincareTaxonomyEmbeddingModelConfig {
         taxonomy_size: generator.taxonomy_size(),
-        embedding_size: 8,
+        embedding_size: 4,
     };
 
     // type MyBackend = Wgpu<f32, i32>;
@@ -136,8 +136,8 @@ fn main() {
 
     // Use custom training loop
     if custom {
-        custom_training_loop::<4, MyAutodiffBackend>(generator, &device);
-
+        generator.precache();
+        custom_training_loop::<8, MyAutodiffBackend>(generator, &device);
         return;
     }
 
@@ -161,15 +161,17 @@ fn main() {
 
         let output = model.forward(batch.origins, batch.branches);
         println!("{}", output);
-        generator.shutdown();
+        generator.shutdown().expect("Failed to shutdown generator");
     } else {
-        let optim = AdamWConfig::new();
-        // .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(1.0)));
+        let optim = AdamWConfig::new()
+            .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(1.0)));
 
         // let optim = crate::model::RiemannianSgdConfig::new();
         // let optim = SgdConfig::new();
 
-        crate::model::train::<4, MyAutodiffBackend>(
+        generator.precache();
+
+        crate::model::train::<8, MyAutodiffBackend>(
             "/mnt/data/data/taxontango_training",
             crate::model::TrainingConfig::new(config, optim),
             generator,

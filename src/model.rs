@@ -508,9 +508,9 @@ pub fn train<const D: usize, B: AutodiffBackend>(
 
     let lr_schedule = LrWarmUpLinearDecaySchedulerConfig {
         initial_lr: 1e-10,
-        top_lr: 2e-3,
-        num_iters: 100_000,
-        decay_iters: 10_000_000,
+        top_lr: 2e-4,
+        num_iters: 20_000, // 100_000 is better, but for testing...
+        decay_iters: 1_000_000,
         min_lr: 1e-6,
     };
 
@@ -547,30 +547,22 @@ pub fn custom_training_loop<const D: usize, B: AutodiffBackend>(
 ) {
     println!("Starting training loop");
 
-    // let rec = rerun::RecordingStreamBuilder::new("rerun_embeddings").spawn().expect("Unable to connect to rerun");
-    // .spawn().expect("Failed to start recording stream");
-
-    // let optim = AdamWConfig::new();
-    // .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(1.0)));
-
-    // let optim = SgdConfig::new();
-    //.with_gradient_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(0.1)));
-
     let optim = AdamWConfig::new();
-    // .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(1.0)));
-
-    // let optim = RiemannianSgdConfig::new();
-    // .with_gradient_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(1.0)));
 
     let config = PoincareTaxonomyEmbeddingModelConfig {
         taxonomy_size: batch_gen.taxonomy_size(),
-        embedding_size: 16,
+        embedding_size: 2,
     };
 
     B::seed(1337);
 
-    let mut lr =
-        burn::lr_scheduler::linear::LinearLrSchedulerConfig::new(1e-2, 1e-10, 1_000_000).init();
+    let lr_schedule = LrWarmUpLinearDecaySchedulerConfig {
+        initial_lr: 1e-10,
+        top_lr: 2e-4,
+        num_iters: 20_000, // 100_000 is better, but for testing...
+        decay_iters: 1_000_000,
+        min_lr: 1e-6,
+    };
 
     let config = TrainingConfig::new(config, optim.clone());
 
@@ -581,7 +573,6 @@ pub fn custom_training_loop<const D: usize, B: AutodiffBackend>(
     let batcher_train: TangoBatcher<B> = TangoBatcher::<B>::new(device.clone());
     let batcher_valid = TangoBatcher::<B::InnerBackend>::new(device.clone());
 
-    let colors = batch_gen.colors.clone();
     let taxa_levels_in_order = batch_gen.levels_in_order.clone();
     let taxa_names = batch_gen.taxa_names.clone();
 
@@ -605,6 +596,8 @@ pub fn custom_training_loop<const D: usize, B: AutodiffBackend>(
         .shuffle(config.seed)
         .num_workers(config.num_workers)
         .build(ds_valid);
+
+    let mut lr = lr_schedule.init();
 
     // Iterate over our training and validation loop for X epochs.
     for epoch in 1..config.num_epochs + 1 {
@@ -644,10 +637,7 @@ pub fn custom_training_loop<const D: usize, B: AutodiffBackend>(
             let grads = loss.backward();
             let grads = GradientsParams::from_grads(grads, &model);
 
-            // Update the model using the optimizer.
-            // model = optim.step(config.learning_rate, model, grads);
-            // model = optim.step(LrScheduler::<B>::step(&mut lr), model, grads);
-            model = optim.step(1e-3, model, grads);
+            model = optim.step(<LrWarmUpLinearDecayScheduler as LrScheduler<B>>::step(&mut lr), model, grads);
         }
 
         // Get the model without autodiff.

@@ -40,21 +40,21 @@ impl PoincareDistance {
 
         let distance = distance.clamp(self.clamp_min, self.clamp_max);
 
-        println!("{}", distance);
+        // println!("{}", distance);
 
         let distance = distance.squeeze(2);
         
-        println!("{}", distance);
+        // println!("{}", distance);
 
         self.acosh(distance)
     }
 
     pub fn acosh<B: Backend, const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
-        println!("{}", x);
         let x = x.clamp_min(1.0);
         let x_squared = x.clone().powf_scalar(2.0).sub_scalar(1.0);
-        // let inside_sqrt = x_squared.clamp_min(self.clamp_min);
-        let sqrt_term = x_squared.sqrt();
+        // This destroys equals being 0, but that's really fine...
+        let inside_sqrt = x_squared.clamp_min(self.clamp_min);
+        let sqrt_term = inside_sqrt.sqrt();
         (x + sqrt_term).log()
     }
 }
