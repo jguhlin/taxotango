@@ -32,7 +32,7 @@ pub enum TaxonomyWriterMessage {
     Completed,
 }
 
-#[derive(PartialEq, PartialOrd, Eq, Ord, Debug, Clone, Copy)]
+#[derive(PartialEq, PartialOrd, Eq, Ord, Debug, Clone, Copy, Hash)]
 pub enum TaxaLevel {
     Root,
     Superkingdom,
@@ -157,50 +157,37 @@ impl TaxaLevel {
     }
 }
 
+pub type TaxonomyGraph = Graph<Taxon, (), Directed, u32>;
+
+#[derive(Hash, Eq, PartialEq, Debug, Clone)]
+pub struct Taxon {
+    pub tax_id: u32,
+    pub parent: u32,
+    pub rank: TaxaLevel,
+    pub name: String,
+}
+
 pub fn build_taxonomy_graph(
     nodes_file: &str,
     names_file: &str,
-) -> (
-    petgraph::Graph<u32, (), Directed>,
-    HashMap<NodeIndex, u32>,
-    HashMap<NodeIndex, TaxaLevel>,
-    Vec<String>,
-    HashMap<u32, TaxaLevel>,
-    Vec<String>,
-    HashMap<u32, NodeIndex>,
-    Vec<Color>,
-) {
-    let names = parse_names(names_file.to_string());
+) -> (TaxonomyGraph, NodeIndex) {
+
+    let taxa_names = parse_names(names_file.to_string());
     let nodes = parse_nodes(nodes_file.to_string());
 
-    log::info!("Parsed names: {} total", names.0.len());
-    log::debug!("Parsed names (first 10): {:?}", &names.0[0..10]);
-    log::debug!("Parsed names (u32, first 10): {:?}", &names.1[0..10]);
+    log::info!("Parsed names: {} total", taxa_names.len());
+    // log::debug!("Parsed names (first 10): {:?}", &taxa_names[0..10]);
+    log::debug!("Parsed names (u32, first 10): {:?}", &taxa_names.iter().map(|x| x.0).collect::<Vec<_>>()[0..10]);
     log::info!("Parsed nodes: {} total", nodes.0.len());
     log::debug!("Parsed nodes (first 10): {:?}", &nodes.0[0..10]);
     log::debug!("Parsed nodes (Strings, first 10): {:?}", &nodes.1[0..10]);
 
-    // When a parent is 0 it means drop it, 1 is the root
+    let taxa_parents: HashMap<u32, u32> = nodes.0.iter().map(|(x, y)| (*x, *y)).collect();
+    let taxa_ranks: HashMap<u32, String> = nodes.1.iter().zip(nodes.0.iter()).map(|(x, y)| (y.0, x.clone())).collect();
+
+    assert!(taxa_names.get(&271808).unwrap() == "Wajira", "Taxa name is not correct: {}", taxa_names.get(&271808).unwrap());
+
     let edges: Vec<(u32, u32)> = nodes.0;
-
-    let levels: HashMap<u32, TaxaLevel> = edges
-        .iter()
-        .zip(nodes.1.iter())
-        .map(|((tax_id, _parent), rank)| {
-            let rank = TaxaLevel::from_str(&rank);
-            (*tax_id, rank)
-        })
-        .collect();
-
-    let levels_in_order: Vec<String> = nodes.1.iter().map(|x| x.clone()).collect();
-
-    let colors: Vec<Color> = nodes
-        .1
-        .iter()
-        .map(|rank| TaxaLevel::from_str(rank).color())
-        .collect();
-
-    let taxa_names: HashMap<u32, String> = names.0.iter().zip(names.1.iter()).map(|(x, y)| (*y, x.clone())).collect();
 
     let nodes: Vec<u32> = edges.iter().flat_map(|(x, y)| [x, y]).copied().collect();
     let nodes = nodes.into_iter().collect::<HashSet<u32>>();
@@ -214,10 +201,22 @@ pub fn build_taxonomy_graph(
 
     log::info!("Building taxonomy graph");
 
-    let mut graph = DiGraph::<u32, (), u32>::with_capacity(nodes.len(), nodes.len());
-    let nodes: HashMap<u32, NodeIndex> = nodes.iter().map(|x| (*x, graph.add_node(1))).collect();
+    // let mut graph = DiGraph::<u32, (), u32>::with_capacity(nodes.len(), nodes.len());
+    let mut graph = DiGraph::<Taxon, (), u32>::with_capacity(nodes.len(), nodes.len());
+
+    let nodes = nodes.into_iter().map(|x|
+        Taxon {
+            tax_id: x,
+            parent: taxa_parents[&x],
+            rank: TaxaLevel::from_str(&taxa_ranks[&x]),
+            name: taxa_names[&x].clone(),
+        }
+    ).collect::<Vec<_>>();
+
+    let nodes: HashMap<u32, NodeIndex> = nodes.into_iter().map(|x| (x.tax_id, graph.add_node(x))).collect();
     let node_indices: HashMap<NodeIndex, u32> = nodes.iter().map(|(x, y)| (*y, *x)).collect();
 
+    let root = nodes[&1];
 
     for (x, y) in edges {
         graph.add_edge(nodes[&y], nodes[&x], ());
@@ -233,22 +232,9 @@ pub fn build_taxonomy_graph(
         }
     }
 
-    log::info!("Removed {} nodes with no neighbors", removed);
-
-    // Rebuild nodes and node_indices
-    let nodes = graph
-        .node_indices()
-        .map(|x| (node_indices[&x], x))
-        .collect::<HashMap<_, _>>();
-    let node_indices = nodes
-        .iter()
-        .map(|(x, y)| (*y, *x))
-        .collect::<HashMap<_, _>>();
-
-    let node_indices_levels: HashMap<NodeIndex, TaxaLevel> = node_indices
-        .iter()
-        .map(|(ni, tax_id)| (*ni, levels[tax_id]))
-        .collect();
+    if removed > 0 {
+        log::info!("Removed {} nodes with no neighbors", removed);
+    }
 
     log::info!(
         "Taxonomy graph built. Node Count: {} - Edge Count: {}",
@@ -256,16 +242,8 @@ pub fn build_taxonomy_graph(
         graph.edge_count()
     );
 
-    (
-        graph,
-        node_indices,
-        node_indices_levels,
-        taxa_names,
-        levels,
-        levels_in_order,
-        nodes,
-        colors,
-    )
+    (graph, root)
+
 }
 
 // Store the taxa dist training element from each node in the graph, and update when given an new element
@@ -324,13 +302,11 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
     names_file: &str,
     threads: usize,
 ) -> BatchGenerator<D> {
-    let (graph, _node_indices, node_indices_levels, taxa_names, levels, levels_in_order, nodes, colors) =
-        build_taxonomy_graph(nodes_file, names_file);
+    let (graph, root) = build_taxonomy_graph(nodes_file, names_file);
 
-    let (tx, rx) = bounded(threads * 2);
+    let (tx, rx) = bounded(threads * 8);
 
-    let taxa_dist_cache: Arc<TaxaDistCache<D>> =
-        Arc::new(TaxaDistCache::with_capacity(graph.node_count()));
+    let taxa_dist_cache: Arc<TaxaDistCache<D>> = Arc::new(TaxaDistCache::with_capacity(graph.node_count()));
 
     // Spawn threads
     let mut jhs = Vec::with_capacity(threads);
@@ -339,12 +315,10 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
     let graph = Arc::new(graph);
     let mut shutdown = Arc::new(AtomicBool::new(false));
     let current = Arc::new(AtomicUsize::new(0));
-    let node_indices_levels = Arc::new(node_indices_levels);
 
     let mut all_nodes = Arc::new(RwLock::new(Vec::new()));
 
     all_nodes = Arc::new(RwLock::new(graph.node_indices().collect::<Vec<_>>()));
-    let root = nodes[&1];
 
     for threadno in 0..threads {
         let tx = tx.clone();
@@ -355,8 +329,6 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
         let current = Arc::clone(&current);
         let all_nodes = Arc::clone(&all_nodes);
         let taxa_dist_cache = Arc::clone(&taxa_dist_cache);
-        let node_indices_levels = Arc::clone(&node_indices_levels);
-        let taxa_names = taxa_names.clone();
         let root = root.clone();
 
         let jh = std::thread::spawn(move || {
@@ -400,8 +372,10 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
                             log::debug!("All Neighbors: {:?}", all_neighbors);
                             log::debug!("Excluded: {:?}", local_excluded);
 
-                            log::debug!("Node is at level: {:?}", node_indices_levels[&idx]);
-                            log::debug!("Node name is {:?}", taxa_names[idx.index()]);
+                            let node = graph[idx].clone();
+
+                            log::debug!("Node is at level: {:?}", node.rank);
+                            log::debug!("Node name is {:?}", node.name);
 
                             break;
                         }
@@ -457,10 +431,11 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
                     distances,
                 };
 
-                let names = taxa_dist.branches.iter().map(|x| taxa_names[*x as usize].clone()).collect::<Vec<_>>();
-                log::debug!("Origin: {} - Branches: {:?} - Distances: {:?} - Names: {:?}", taxa_names[taxa_dist.origin as usize], taxa_dist.branches, taxa_dist.distances, names);
-
-                
+                // let names = taxa_dist.branches.iter().map(|x| graph.raw_nodes()[*x as usize].weight.name.clone()).collect::<Vec<_>>();
+                // let branches_debug = taxa_dist.branches.iter().map(|x| graph.raw_nodes()[*x as usize].weight.tax_id).collect::<Vec<_>>();
+                // let origin_tax_id = graph.raw_nodes()[idx.index() as usize].weight.tax_id;
+                // let tax_ids_debug = taxa_dist.branches.iter().map(|x| graph.raw_nodes()[*x as usize].weight.tax_id).collect::<Vec<_>>();
+                // log::debug!("Origin: {} {} - Branches TaxID: {:?} - Distances: {:?} - Names: {:?} - Tax IDs: {:?}", graph.raw_nodes()[taxa_dist.origin as usize].weight.name.clone(), origin_tax_id, branches_debug, taxa_dist.distances, names, tax_ids_debug);
 
                 taxa_dist_cache.update(idx.index(), taxa_dist.clone());
             }
@@ -472,21 +447,16 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
     BatchGenerator {
         root,
         epoch_size: graph.node_count(),
-        graph: graph,
-        levels,
+        graph,
         join_handles: jhs,
         shutdown,
         receiver: rx,
-        nodes,
-        colors,
-        levels_in_order,
-        taxa_names,
         taxa_dist_cache,
     }
 }
 
 fn random_walk_bfs<R: Rng>(
-    graph: &Graph<u32, (), Directed, u32>,
+    graph: &TaxonomyGraph,
     rng: &mut R,
     start: NodeIndex,
     depth: usize,
@@ -528,7 +498,7 @@ fn random_walk_bfs<R: Rng>(
 }
 
 fn random_walk<R: Rng>(
-    graph: &Graph<u32, (), Undirected, u32>,
+    graph: &TaxonomyGraph,
     rng: &mut R,
     start: NodeIndex,
     depth: usize,
@@ -630,7 +600,7 @@ fn random_walk<R: Rng>(
 }
 
 fn random_walk_alt<R: Rng>(
-    graph: &Graph<u32, (), Undirected, u32>,
+    graph: &TaxonomyGraph,
     rng: &mut R,
     start: NodeIndex,
     depth: usize,
@@ -662,7 +632,7 @@ fn random_walk_alt<R: Rng>(
 }
 
 fn bfs_distance(
-    graph: &Graph<u32, (), Undirected, u32>,
+    graph: &TaxonomyGraph,
     start: NodeIndex,
     end: NodeIndex,
 ) -> Option<usize> {
@@ -691,7 +661,7 @@ fn bfs_distance(
 }
 
 fn bfs_distance_alt(
-    graph: &Graph<u32, (), Undirected, u32>,
+    graph: &TaxonomyGraph,
     start: NodeIndex,
     end: NodeIndex,
     max_depth: Option<usize>,
@@ -724,7 +694,7 @@ fn bfs_distance_alt(
 }
 
 fn dfs_distance(
-    graph: &Graph<u32, (), Undirected, u32>,
+    graph: &TaxonomyGraph,
     start: NodeIndex,
     end: NodeIndex,
 ) -> Option<usize> {
@@ -753,7 +723,7 @@ fn dfs_distance(
 }
 
 fn dfs_distance_alt(
-    graph: &Graph<u32, (), Undirected, u32>,
+    graph: &TaxonomyGraph,
     start: NodeIndex,
     end: NodeIndex,
 ) -> Option<usize> {
@@ -779,7 +749,7 @@ fn dfs_distance_alt(
 
 // Taxa level aware
 fn dfs_distance_alt_taxalevel(
-    graph: &Graph<u32, (), Directed, u32>,
+    graph: &TaxonomyGraph,
     start: NodeIndex,
     end: NodeIndex,
     node_indices_levels: &Arc<HashMap<NodeIndex, TaxaLevel>>,
@@ -825,7 +795,7 @@ fn dfs_distance_alt_taxalevel(
 
 // Taxa level aware
 fn root_calc(
-    graph: &Graph<u32, (), Directed, u32>,
+    graph: &TaxonomyGraph,
     start: NodeIndex,
     end: NodeIndex,
     root: NodeIndex,
@@ -891,16 +861,11 @@ fn root_calc(
 
 pub struct BatchGenerator<const D: usize> {
     pub root: NodeIndex,
-    pub graph: Arc<Graph<u32, (), Directed, u32>>,
+    pub graph: Arc<Graph<Taxon, (), Directed, u32>>,
     epoch_size: usize,
-    pub levels: HashMap<u32, TaxaLevel>,
     join_handles: Vec<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
     receiver: crossbeam::channel::Receiver<TaxaDistance<D>>,
-    pub nodes: HashMap<u32, NodeIndex>,
-    pub colors: Vec<Color>,
-    pub levels_in_order: Vec<String>,
-    pub taxa_names: Vec<String>,
     pub taxa_dist_cache: Arc<TaxaDistCache<D>>,
 }
 
@@ -965,49 +930,14 @@ impl<const D: usize> BatchGenerator<D> {
 
         Ok(())
     }
-
-    /*
-
-    pub fn testing() -> Self {
-        let mut graph = UnGraph::<u32, (), u32>::with_capacity(100_000, 100_000);
-        let nodes: HashMap<u32, NodeIndex> = (0..100_000_u32)
-            .into_iter()
-            .map(|x| (x, graph.add_node(1)))
-            .collect();
-
-        let mut rng = Xoshiro256PlusPlus::seed_from_u64(1337);
-
-        // Connect nodes to each other in order
-        for i in 0..100_000_u32 {
-            if i > 0 {
-                graph.add_edge(nodes[&(i - 1)], nodes[&i], ());
-            }
-        }
-
-        let levels = HashMap::new();
-
-        Self {
-            graph: Arc::new(graph),
-            rng,
-            epoch_size: 1024,
-            levels,
-        }
-    }
-    */
-
     pub fn valid(&self) -> Self {
         BatchGenerator {
             root: self.root,
             graph: Arc::clone(&self.graph),
             epoch_size: 2048,
-            levels: self.levels.clone(),
             join_handles: vec![],
             shutdown: Arc::clone(&self.shutdown),
             receiver: self.receiver.clone(),
-            nodes: self.nodes.clone(),
-            colors: self.colors.clone(),
-            levels_in_order: self.levels_in_order.clone(),
-            taxa_names: self.taxa_names.clone(),
             taxa_dist_cache: Arc::clone(&self.taxa_dist_cache),
         }
     }
@@ -1017,7 +947,11 @@ impl<const D: usize> BatchGenerator<D> {
     }
 }
 
-pub fn parse_nodes(filename: String) -> (Vec<(u32, u32)>, Vec<String>) {
+// Type alias
+pub type TaxId = u32;
+pub type TaxonRank = String;
+
+pub fn parse_nodes(filename: String) -> (Vec<(TaxId, TaxId)>, Vec<TaxonRank>) {
     let mut taxon_to_parent: Vec<(u32, u32)> = Vec::with_capacity(4_000_000);
     let mut taxon_rank: Vec<String> = Vec::with_capacity(4_000_000);
 
@@ -1046,8 +980,10 @@ pub fn parse_nodes(filename: String) -> (Vec<(u32, u32)>, Vec<String>) {
     (taxon_to_parent, taxon_rank)
 }
 
-pub fn parse_names(filename: String) -> (Vec<String>, Vec<u32>) {
-    let mut names: Vec<String> = Vec::with_capacity(3_006_098);
+pub type TaxonName = String;
+
+pub fn parse_names(filename: String) -> HashMap<TaxId, TaxonName> {
+    let mut names = HashMap::default();
 
     let reader = BufReader::new(File::open(filename).expect("Unable to open taxonomy names file"));
 
@@ -1063,24 +999,14 @@ pub fn parse_names(filename: String) -> (Vec<String>, Vec<u32>) {
 
         let id: usize = split[0].parse().expect("Error converting to number");
         let name: &str = &split[1];
-        let class: &str = &split[3];
+        // let class: &str = &split[3];
 
-        match names.get(id) {
-            None => {
-                names.resize(id + 1, "".to_string());
-                names[id] = name.into();
-                taxids.insert(id as u32);
-            }
-            Some(_) => {
-                if class == "scientific name" {
-                    names[id] = name.into();
-                }
-            }
-        };
+        // Set if only not set (some have multiple names)
+        if !taxids.contains(&id) {
+            names.insert(id as u32, name.to_string());
+            taxids.insert(id);
+        }
     }
 
-    let mut taxids = taxids.into_iter().collect::<Vec<u32>>();
-    taxids.sort_unstable();
-
-    (names, taxids)
+    names
 }

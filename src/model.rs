@@ -509,7 +509,7 @@ pub fn train<const D: usize, B: AutodiffBackend>(
     let lr_schedule = LrWarmUpLinearDecaySchedulerConfig {
         initial_lr: 1e-10,
         top_lr: 2e-4,
-        num_iters: 20_000, // 100_000 is better, but for testing...
+        num_iters: 40_000, // 100_000 is better, but for testing...
         decay_iters: 1_000_000,
         min_lr: 1e-6,
     };
@@ -572,16 +572,6 @@ pub fn custom_training_loop<const D: usize, B: AutodiffBackend>(
 
     let batcher_train: TangoBatcher<B> = TangoBatcher::<B>::new(device.clone());
     let batcher_valid = TangoBatcher::<B::InnerBackend>::new(device.clone());
-
-    let taxa_levels_in_order = batch_gen.levels_in_order.clone();
-    let taxa_names = batch_gen.taxa_names.clone();
-
-    // Combine taxa level and taxa name
-    let per_node_string: Vec<String> = taxa_levels_in_order
-        .iter()
-        .zip(taxa_names.iter())
-        .map(|(level, name)| format!("{}: {}", level, name))
-        .collect();
 
     let ds_valid = batch_gen.valid();
 
