@@ -1,31 +1,38 @@
+use bumpalo::Bump;
 use burn::data::dataset::{Dataset, DatasetIterator};
+use crossbeam::channel::bounded;
 use petgraph::adj::NodeIndices;
 use petgraph::algo::astar;
-use petgraph::prelude::*;
-use crossbeam::channel::bounded;
 use petgraph::graph::{NodeIndex, UnGraph};
+use petgraph::prelude::*;
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 use rand::seq::SliceRandom;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use rerun::Color;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
+use fnv::FnvHashMap as HashMap;
+use fnv::FnvHashSet as HashSet;
+
 pub mod model;
 pub use model::*;
+
+pub mod layers;
+pub use layers::*;
 
 pub enum TaxonomyWriterMessage {
     Write(Vec<(NodeIndex, NodeIndex, u8)>),
     Completed,
 }
 
-#[derive(PartialEq, PartialOrd, Eq, Ord, Debug, Clone, Copy)]
+#[derive(PartialEq, PartialOrd, Eq, Ord, Debug, Clone, Copy, Hash)]
 pub enum TaxaLevel {
     Root,
     Superkingdom,
@@ -150,56 +157,83 @@ impl TaxaLevel {
     }
 }
 
-pub fn build_taxonomy_graph_generator<const D: usize>(
+pub type TaxonomyGraph = Graph<Taxon, (), Directed, u32>;
+
+#[derive(Hash, Eq, PartialEq, Debug, Clone)]
+pub struct Taxon {
+    pub tax_id: u32,
+    pub parent: u32,
+    pub rank: TaxaLevel,
+    pub name: String,
+}
+
+pub fn build_taxonomy_graph(
     nodes_file: &str,
     names_file: &str,
-    threads: usize,
-) -> BatchGenerator<D> {
-    // acc2tax todo: change it so we are passing &str
-    let names = parse_names(names_file.to_string());
+) -> (TaxonomyGraph, NodeIndex) {
+
+    let taxa_names = parse_names(names_file.to_string());
     let nodes = parse_nodes(nodes_file.to_string());
 
-    log::info!("Parsed names: {} total", names.0.len());
-    log::debug!("Parsed names (first 10): {:?}", &names.0[0..10]);
-    log::debug!("Parsed names (u32, first 10): {:?}", &names.1[0..10]);
+    log::info!("Parsed names: {} total", taxa_names.len());
+    // log::debug!("Parsed names (first 10): {:?}", &taxa_names[0..10]);
+    log::debug!("Parsed names (u32, first 10): {:?}", &taxa_names.iter().map(|x| x.0).collect::<Vec<_>>()[0..10]);
     log::info!("Parsed nodes: {} total", nodes.0.len());
     log::debug!("Parsed nodes (first 10): {:?}", &nodes.0[0..10]);
     log::debug!("Parsed nodes (Strings, first 10): {:?}", &nodes.1[0..10]);
 
-    // When a parent is 0 it means drop it, 1 is the root
+    let taxa_parents: HashMap<u32, u32> = nodes.0.iter().map(|(x, y)| (*x, *y)).collect();
+    let taxa_ranks: HashMap<u32, String> = nodes.1.iter().zip(nodes.0.iter()).map(|(x, y)| (y.0, x.clone())).collect();
+
+    assert!(taxa_names.get(&271808).unwrap() == "Wajira", "Taxa name is not correct: {}", taxa_names.get(&271808).unwrap());
+
     let edges: Vec<(u32, u32)> = nodes.0;
-
-    let levels: HashMap<u32, TaxaLevel> = edges.iter().zip(nodes.1.iter()).map(
-        |((tax_id, _parent), rank)| {
-            let rank = TaxaLevel::from_str(&rank);
-            (*tax_id, rank)
-        }
-    ).collect();
-
-    let levels_in_order: Vec<String> = nodes.1.iter().map(|x| x.clone()).collect();
-
-    let colors: Vec<Color> = nodes
-        .1
-        .iter()
-        .map(|rank| TaxaLevel::from_str(rank).color())
-        .collect();
-
-    let taxa_names: Vec<String> = names.0;
 
     let nodes: Vec<u32> = edges.iter().flat_map(|(x, y)| [x, y]).copied().collect();
     let nodes = nodes.into_iter().collect::<HashSet<u32>>();
     let nodes = nodes.into_iter().collect::<Vec<u32>>();
 
+    log::debug!("Total Nodes: {}", nodes.len());
+    log::debug!("Total Taxa Names: {}", taxa_names.len());
+    assert!(nodes.len() == taxa_names.len(), "Nodes and names are not the same length");
+
     log::debug!("Total Edges: {}", edges.len());
 
     log::info!("Building taxonomy graph");
 
-    let mut graph = UnGraph::<u32, (), u32>::with_capacity(nodes.len(), nodes.len());
-    let nodes: HashMap<u32, NodeIndex> = nodes.iter().map(|x| (*x, graph.add_node(1))).collect();
+    // let mut graph = DiGraph::<u32, (), u32>::with_capacity(nodes.len(), nodes.len());
+    let mut graph = DiGraph::<Taxon, (), u32>::with_capacity(nodes.len(), nodes.len());
+
+    let nodes = nodes.into_iter().map(|x|
+        Taxon {
+            tax_id: x,
+            parent: taxa_parents[&x],
+            rank: TaxaLevel::from_str(&taxa_ranks[&x]),
+            name: taxa_names[&x].clone(),
+        }
+    ).collect::<Vec<_>>();
+
+    let nodes: HashMap<u32, NodeIndex> = nodes.into_iter().map(|x| (x.tax_id, graph.add_node(x))).collect();
     let node_indices: HashMap<NodeIndex, u32> = nodes.iter().map(|(x, y)| (*y, *x)).collect();
 
+    let root = nodes[&1];
+
     for (x, y) in edges {
-        graph.add_edge(nodes[&x], nodes[&y], ());
+        graph.add_edge(nodes[&y], nodes[&x], ());
+    }
+
+    // Remove any that have no neighbors
+    let mut removed = 0;
+    for (i, ni) in nodes.iter() {
+        let neighbors = graph.neighbors(*ni);
+        if neighbors.count() == 0 {
+            graph.remove_node(*ni);
+            removed += 1;
+        }
+    }
+
+    if removed > 0 {
+        log::info!("Removed {} nodes with no neighbors", removed);
     }
 
     log::info!(
@@ -208,92 +242,71 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
         graph.edge_count()
     );
 
-    // Iterate through all nodes and calculate how many connections there are (median, max, min)
-    let mut max = 0;
-    let mut min = std::u32::MAX;
-    let mut total = 0;
+    (graph, root)
 
-    let median = graph
-        .node_indices()
-        .map(|idx| graph.neighbors(idx).count() as u32)
-        .collect::<Vec<u32>>();
+}
 
-    // How many are over 100, 1000, 10000
-    let over_100 = median.iter().filter(|x| **x > 100).count();
-    let over_1000 = median.iter().filter(|x| **x > 1000).count();
-    let over_10000 = median.iter().filter(|x| **x > 10000).count();
+// Store the taxa dist training element from each node in the graph, and update when given an new element
+// Allows for training to continue even if new data is not yet ready
+pub struct TaxaDistCache<const D: usize> {
+    pub cache: Arc<RwLock<Vec<TaxaDistance<D>>>>,
+    pub last_used: Arc<AtomicUsize>,
+}
 
-    // over 200, 300, 400, 500
-    let over_200 = median.iter().filter(|x| **x > 200).count();
-    let over_300 = median.iter().filter(|x| **x > 300).count();
-    let over_400 = median.iter().filter(|x| **x > 400).count();
-    let over_500 = median.iter().filter(|x| **x > 500).count();
-
-    for i in &median {
-        total += i;
-        if *i > max {
-            max = *i;
-        }
-
-        if *i < min {
-            min = *i;
+impl<const D: usize> TaxaDistCache<D> {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            cache: Arc::new(RwLock::new(Vec::with_capacity(capacity))),
+            last_used: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    let median_pos = total / median.len() as u32;
-    let median = median[median_pos as usize];
+    pub fn update(&self, i: usize, element: TaxaDistance<D>) {
+        let mut cache = self.cache.write().unwrap();
+        if cache.len() <= i {
+            cache.resize(i + 1, element);
+        } else {
+            cache[i] = element;
+        }
 
-    log::info!("Median: {} - Max: {} - Min: {}", median, max, min);
-    log::info!(
-        "Over 100: {} - Over 1000: {} - Over 10000: {}",
-        over_100,
-        over_1000,
-        over_10000
-    );
-
-    println!("Median: {} - Max: {} - Min: {}", median, max, min);
-    println!(
-        "Over 100: {} - Over 1000: {} - Over 10000: {}",
-        over_100, over_1000, over_10000
-    );
-    println!(
-        "Over 200: {} - Over 300: {} - Over 400: {} - Over 500: {}",
-        over_200, over_300, over_400, over_500
-    );
-
-    // Remove all from the graph that have over 200 connections
-    // todo make this smart
-    /*
-    let mut to_remove = vec![];
-
-    for idx in graph.node_indices() {
-        if graph.neighbors(idx).count() > 200 {
-            to_remove.push(idx);
+        if i == 0 {
+            log::debug!("Cache has started to fill...");
         }
     }
 
-    for idx in to_remove {
-        graph.remove_node(idx);
-    } */
-
-    if petgraph::algo::is_cyclic_undirected(&graph) {
-        println!("Graph is cyclic");
+    pub fn len(&self) -> usize {
+        self.cache.read().unwrap().len()
     }
 
-    /*
-    // Testing stuff
-    let mut neighbors = graph.neighbors(nodes[&262]).collect::<Vec<_>>();
-    println!("Neighbors of 262: {:?}", neighbors);
-    let converted_back = neighbors.iter().map(|x| node_indices[x]).collect::<Vec<_>>();
-    println!("Neighbors of 262: {:?}", converted_back);
+    pub fn get(&self, i: usize) -> TaxaDistance<D> {
+        let cache = self.cache.read().unwrap();
 
-    let mut rng = Xoshiro256PlusPlus::seed_from_u64(1337);
-    let output = random_walk(&graph, &mut rng, nodes[&262], 5, vec![]);
-    println!("Random walk: {:?}", output);
+        if i >= cache.len() {
+            if self.last_used.load(std::sync::atomic::Ordering::Relaxed) >= cache.len() {
+                self.last_used
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+            }
 
-    panic!(); */
+            cache[self
+                .last_used
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)]
+            .clone()
+        } else {
+            cache[i].clone()
+        }
+    }
+}
 
-    let (tx, rx) = bounded(8192 * 16);
+pub fn build_taxonomy_graph_generator<const D: usize>(
+    nodes_file: &str,
+    names_file: &str,
+    threads: usize,
+) -> BatchGenerator<D> {
+    let (graph, root) = build_taxonomy_graph(nodes_file, names_file);
+
+    let (tx, rx) = bounded(threads * 8);
+
+    let taxa_dist_cache: Arc<TaxaDistCache<D>> = Arc::new(TaxaDistCache::with_capacity(graph.node_count()));
 
     // Spawn threads
     let mut jhs = Vec::with_capacity(threads);
@@ -307,155 +320,206 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
 
     all_nodes = Arc::new(RwLock::new(graph.node_indices().collect::<Vec<_>>()));
 
-    for _ in 0..threads {
+    for threadno in 0..threads {
         let tx = tx.clone();
         let graph = Arc::clone(&graph);
         let shutdown = Arc::clone(&shutdown);
-        let rng1 = rng.clone();
+        rng.long_jump();
+        let mut rng = rng.clone();
         let current = Arc::clone(&current);
         let all_nodes = Arc::clone(&all_nodes);
+        let taxa_dist_cache = Arc::clone(&taxa_dist_cache);
+        let root = root.clone();
 
         let jh = std::thread::spawn(move || {
-            let mut rng = rng1;
+            let mut local_excluded = HashSet::default();
+            let mut branches = [0; D];
+            let mut distances = [0; D];
+            let mut depths = vec![None; graph.node_count()];
 
-            // 1/2 are nearby, 1/2 are far away as 'negative' samples
-            let cutoff = (D as f32 * 0.5) as usize;
-            let further = D - cutoff;
-
-            'outer: loop {
+            loop {
                 if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
 
-                // let i = rng.gen_range(0..len) as u32;
-                // let idx = graph.node_indices().nth(i as usize).unwrap();
-                let mut idx = current.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let idx = loop {
+                    let i = current.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= all_nodes.read().unwrap().len() {
+                        current.store(0, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                    break all_nodes.read().unwrap()[i];
+                };
 
-                if idx >= all_nodes.read().unwrap().len() {
-                    current.store(0, std::sync::atomic::Ordering::Relaxed);
-                    idx = current.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
+                local_excluded.clear();
+                local_excluded.insert(idx);
 
-                let idx = all_nodes.read().unwrap()[idx];
+                // Nearby samples
+                for i in 0..D / 2 {
+                    let mut depth = rng.gen_range(1..8);
 
-                let mut branches = [0; D];
-                let mut distances = [0; D];
-
-                let mut used = HashSet::new();
-
-                for i in 0..cutoff {
-                    let depth = rng.gen_range(1..6);
                     let mut node = None;
-
-                    let mut iters = 0;
+                    let mut tries = 0;
                     while node.is_none() {
-                        iters += 1;
-
-                        if iters > 100 {
-                            // Remove this node from the list
-                            all_nodes.write().unwrap().retain(|&x| x != idx);
-                            log::debug!("Removed node: {}", idx.index());
-                            continue 'outer;
+                        if tries > 10 {
+                            depth += 1;
                         }
 
-                        node = random_walk(
+                        if tries > 1000 {
+                            log::debug!("Node {} has no neighbors - random_walk_bfs search", idx.index());
+                            
+                            let all_neighbors = graph.neighbors_undirected(idx).collect::<Vec<_>>();
+                            log::debug!("All Neighbors: {:?}", all_neighbors);
+                            log::debug!("Excluded: {:?}", local_excluded);
+
+                            let node = graph[idx].clone();
+
+                            log::debug!("Node is at level: {:?}", node.rank);
+                            log::debug!("Node name is {:?}", node.name);
+
+                            break;
+                        }
+
+                        tries += 1;
+                        node = random_walk_bfs(
                             Arc::as_ref(&graph),
                             &mut rng,
                             idx,
                             depth,
-                            vec![idx],
+                            &local_excluded,
+                            &mut depths,
                         );
+                        depths.iter_mut().for_each(|x| *x = None);
                     }
 
                     let node = node.unwrap();
 
-                    // Get actual distance with astar
+                    local_excluded.insert(node.0);
+                    branches[i] = node.0.index() as u32;
+                    distances[i] = node.1;
+                }
 
-                    let distance = astar(
-                        Arc::as_ref(&graph),
-                        idx,
-                        |finish| finish == node,
-                        |_| 1,
-                        |_| 0,
-                    );
-                    // let distance = bfs_distance(Arc::as_ref(&graph), idx, node);
-
-                    let distance = distance.unwrap().0 as u32;
-
-                    if node == idx {
-                        panic!("Same node");
+                // Far away samples
+                let all_nodes_read = all_nodes.read().unwrap();
+                for i in D / 2..D {
+                    let end = *all_nodes_read.choose(&mut rng).unwrap();
+                    // if let Some(distance) = dfs_distance_alt_taxalevel(Arc::as_ref(&graph), idx, end, &node_indices_levels) {
+                    if let Some(distance) = root_calc(Arc::as_ref(&graph), idx, end, root) {
+                        branches[i] = end.index() as u32;
+                        distances[i] = distance as u32;
+                    } else {
+                        // If path not found, try another random node
+                        continue;
                     }
-
-                    used.insert(node);
-                    branches[i] = node.index() as u32;
-                    distances[i] = distance;
                 }
 
-                for i in cutoff..further {
-                    // Pick a completely random node
-                    let end = all_nodes.read().unwrap().choose(&mut rng).unwrap().clone();
-                        
-                    // let distance = dfs_distance(Arc::as_ref(&graph), idx, end);
-
-                    let distance = astar(
-                        Arc::as_ref(&graph),
-                        idx,
-                        |finish| finish == end,
-                        |_| 1,
-                        |_| 0,
+                // None of the distances should be 0
+                if distances.iter().any(|&x| x == 0) {
+                    // If so, show all branches and distances, and the origin
+                    log::debug!(
+                        "Branches: {:?}, Distances: {:?}, Origin: {}",
+                        branches,
+                        distances,
+                        idx.index()
                     );
-
-                    // let (node, depth) = self.random_walk(idx, depth);
-                    branches[i] = end.index() as u32;
-                    distances[i] = distance.unwrap().0 as u32;
+                    panic!();
                 }
 
-                tx.send(TaxaDistance {
+                let taxa_dist = TaxaDistance {
                     origin: idx.index() as u32,
                     branches,
                     distances,
-                })
-                .unwrap();
+                };
+
+                // let names = taxa_dist.branches.iter().map(|x| graph.raw_nodes()[*x as usize].weight.name.clone()).collect::<Vec<_>>();
+                // let branches_debug = taxa_dist.branches.iter().map(|x| graph.raw_nodes()[*x as usize].weight.tax_id).collect::<Vec<_>>();
+                // let origin_tax_id = graph.raw_nodes()[idx.index() as usize].weight.tax_id;
+                // let tax_ids_debug = taxa_dist.branches.iter().map(|x| graph.raw_nodes()[*x as usize].weight.tax_id).collect::<Vec<_>>();
+                // log::debug!("Origin: {} {} - Branches TaxID: {:?} - Distances: {:?} - Names: {:?} - Tax IDs: {:?}", graph.raw_nodes()[taxa_dist.origin as usize].weight.name.clone(), origin_tax_id, branches_debug, taxa_dist.distances, names, tax_ids_debug);
+
+                taxa_dist_cache.update(idx.index(), taxa_dist.clone());
             }
         });
 
-        rng.long_jump();
         jhs.push(jh);
     }
 
     BatchGenerator {
+        root,
         epoch_size: graph.node_count(),
-        graph: graph,
-        levels,
+        graph,
         join_handles: jhs,
         shutdown,
         receiver: rx,
-        nodes,
-        colors,
-        levels_in_order,
-        taxa_names,
+        taxa_dist_cache,
+    }
+}
+
+fn random_walk_bfs<R: Rng>(
+    graph: &TaxonomyGraph,
+    rng: &mut R,
+    start: NodeIndex,
+    depth: usize,
+    excluded_nodes: &HashSet<NodeIndex>,
+    depths: &mut Vec<Option<usize>>,
+) -> Option<(NodeIndex, u32)> {
+    let mut current_depth;
+
+    let mut candidates = Vec::new();
+
+    for neighbor in graph.neighbors_undirected(start) {
+        candidates.push((neighbor, 1_u32));
+    }
+
+    while let Some(node) = candidates.pop() {
+        current_depth = node.1;
+
+        // Stop early once we have passed the desired depth
+        if current_depth as usize > depth {
+            break;
+        }
+
+        for neighbor in graph.neighbors_undirected(node.0) {
+            candidates.push((neighbor, (current_depth + 1) as u32));
+        }
+    }
+
+    // Remove excluded nodes
+    let filtered_candidates = candidates
+        .iter()
+        .filter(|x| !excluded_nodes.contains(&x.0))
+        .collect::<Vec<_>>();
+
+    if !filtered_candidates.is_empty() {
+        Some(**filtered_candidates.choose(rng).unwrap())
+    } else {
+        None
     }
 }
 
 fn random_walk<R: Rng>(
-    graph: &Graph<u32, (), Undirected, u32>,
+    graph: &TaxonomyGraph,
     rng: &mut R,
     start: NodeIndex,
     depth: usize,
-    excluded_nodes: Vec<NodeIndex>,
-) -> Option<NodeIndex> {
+    excluded_nodes: &HashSet<NodeIndex>,
+) -> Option<(NodeIndex, u32)> {
     let mut current_node = start;
     let mut visited_nodes = vec![current_node];
 
-    for curdepth in 0..depth {
+    for curdepth in 1..depth {
         let mut neighbors: Vec<_> = graph
-            .neighbors(current_node)
+            .neighbors_undirected(current_node)
             .filter(|&n| !visited_nodes.contains(&n))
             .collect();
 
+        if depth == 1 && neighbors.is_empty() {
+            log::debug!("Node {} has no neighbors", current_node.index());
+        }
+
         if neighbors.is_empty() {
             if start != current_node {
-                return Some(current_node);
+                return Some((current_node, curdepth as u32));
             } else {
                 return None;
             }
@@ -468,41 +532,40 @@ fn random_walk<R: Rng>(
 
         if neighbors.is_empty() {
             if start != current_node {
-                return Some(current_node);
+                return Some((current_node, curdepth as u32));
             } else {
                 return None;
             }
         }
 
-/*        let mut neighbors_neighbor_count = neighbors
-            .iter()
-            .map(|x| graph.neighbors(*x).count())
-            .collect::<Vec<_>>(); */
+        /*        let mut neighbors_neighbor_count = neighbors
+        .iter()
+        .map(|x| graph.neighbors(*x).count())
+        .collect::<Vec<_>>(); */
 
         // if curdepth < depth - 1 {
-            // Means we have more than one level to go, so try to avoid dead ends
-            // Filter neighbors that have more than 1 neighbor
-            // And filter neighbor counts to use as weights
-            
-            
-            /*
-            neighbors = neighbors_neighbor_count
-                .iter()
-                .enumerate()
-                .filter(|(_, x)| **x > 1)
-                .map(|(i, _)| neighbors[i])
-                .collect();
+        // Means we have more than one level to go, so try to avoid dead ends
+        // Filter neighbors that have more than 1 neighbor
+        // And filter neighbor counts to use as weights
 
-            neighbors_neighbor_count = neighbors_neighbor_count
-                .into_iter()
-                .filter(|x| *x > 1)
-                .collect();
-            */
+        /*
+        neighbors = neighbors_neighbor_count
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| **x > 1)
+            .map(|(i, _)| neighbors[i])
+            .collect();
+
+        neighbors_neighbor_count = neighbors_neighbor_count
+            .into_iter()
+            .filter(|x| *x > 1)
+            .collect();
+        */
         // }
 
         if neighbors.is_empty() {
             if start != current_node {
-                return Some(current_node);
+                return Some((current_node, curdepth as u32));
             } else {
                 return None;
             }
@@ -514,11 +577,10 @@ fn random_walk<R: Rng>(
 
         let mut next_node = rng.gen_range(0..neighbors.len());
         while curdepth < depth - 1 && graph.neighbors(neighbors[next_node]).count() == 1 {
-
             if neighbors.len() == 1 {
                 current_node = neighbors[next_node];
                 if start != current_node {
-                    return Some(current_node);
+                    return Some((current_node, curdepth as u32));
                 } else {
                     return None;
                 }
@@ -533,13 +595,44 @@ fn random_walk<R: Rng>(
         visited_nodes.push(neighbors[next_node]);
         current_node = neighbors[next_node];
     }
-    
 
-    Some(current_node)
+    Some((current_node, depth as u32))
+}
+
+fn random_walk_alt<R: Rng>(
+    graph: &TaxonomyGraph,
+    rng: &mut R,
+    start: NodeIndex,
+    depth: usize,
+    excluded_nodes: &HashSet<NodeIndex>,
+) -> Option<(NodeIndex, u32)> {
+    let mut current_node = start;
+    let mut visited_nodes = HashSet::default();
+    visited_nodes.insert(current_node);
+
+    for current_depth in 0..depth {
+        let neighbors: Vec<_> = graph
+            .neighbors(current_node)
+            .filter(|&n| !visited_nodes.contains(&n) && !excluded_nodes.contains(&n))
+            .collect();
+
+        if neighbors.is_empty() {
+            return if current_node != start {
+                Some((current_node, current_depth as u32))
+            } else {
+                None
+            };
+        }
+
+        current_node = *neighbors.choose(rng).unwrap();
+        visited_nodes.insert(current_node);
+    }
+
+    Some((current_node, depth as u32))
 }
 
 fn bfs_distance(
-    graph: &Graph<u32, (), Undirected, u32>,
+    graph: &TaxonomyGraph,
     start: NodeIndex,
     end: NodeIndex,
 ) -> Option<usize> {
@@ -567,8 +660,41 @@ fn bfs_distance(
     None
 }
 
+fn bfs_distance_alt(
+    graph: &TaxonomyGraph,
+    start: NodeIndex,
+    end: NodeIndex,
+    max_depth: Option<usize>,
+) -> Option<usize> {
+    let mut queue = VecDeque::new();
+    let mut visited = HashSet::default();
+
+    queue.push_back((start, 0));
+    visited.insert(start);
+
+    while let Some((node, distance)) = queue.pop_front() {
+        if node == end {
+            return Some(distance);
+        }
+
+        if let Some(max) = max_depth {
+            if distance >= max {
+                continue;
+            }
+        }
+
+        for neighbor in graph.neighbors(node) {
+            if visited.insert(neighbor) {
+                queue.push_back((neighbor, distance + 1));
+            }
+        }
+    }
+
+    None
+}
+
 fn dfs_distance(
-    graph: &Graph<u32, (), Undirected, u32>,
+    graph: &TaxonomyGraph,
     start: NodeIndex,
     end: NodeIndex,
 ) -> Option<usize> {
@@ -589,34 +715,168 @@ fn dfs_distance(
             if distances[neighbor.index()].is_none() {
                 distances[neighbor.index()] = Some(current_distance + 1);
             }
-        }        
+        }
     }
 
-    // If we finish BFS without finding the target node, return None
+    // If we finish DFS without finding the target node, return None
     None
 }
 
+fn dfs_distance_alt(
+    graph: &TaxonomyGraph,
+    start: NodeIndex,
+    end: NodeIndex,
+) -> Option<usize> {
+    let mut queue = VecDeque::new();
+    let mut visited = HashSet::default();
+    queue.push_back((start, 0));
+    visited.insert(start);
+
+    while let Some((node, distance)) = queue.pop_front() {
+        if node == end {
+            return Some(distance);
+        }
+
+        for neighbor in graph.neighbors(node) {
+            if visited.insert(neighbor) {
+                queue.push_back((neighbor, distance + 1));
+            }
+        }
+    }
+
+    None
+}
+
+// Taxa level aware
+fn dfs_distance_alt_taxalevel(
+    graph: &TaxonomyGraph,
+    start: NodeIndex,
+    end: NodeIndex,
+    node_indices_levels: &Arc<HashMap<NodeIndex, TaxaLevel>>,
+) -> Option<usize> {
+    let mut queue = VecDeque::new();
+    let mut visited = HashSet::default();
+    queue.push_back((start, 0));
+    visited.insert(start);
+
+    let target_taxa_level = node_indices_levels[&end];
+    let start_taxa_level = node_indices_levels[&start];
+
+    let no_deeper_than = target_taxa_level.max(start_taxa_level);
+
+    log::debug!(
+        "Start: {:?} - End: {:?} - Target Level: {:?} - Start Level: {:?} - No Deeper Than: {:?}",
+        start,
+        end,
+        target_taxa_level,
+        start_taxa_level,
+        no_deeper_than
+    );
+
+
+
+    while let Some((node, distance)) = queue.pop_front() {
+        if node == end {
+            return Some(distance);
+        }
+
+        for neighbor in graph.neighbors(node) {
+            let neighbor_taxa_level = node_indices_levels[&neighbor];
+
+            // If neighbor is deeper than target AND the starting node, skip
+            if neighbor_taxa_level <= no_deeper_than && visited.insert(neighbor) {
+                queue.push_back((neighbor, distance + 1));
+            }
+        }
+    }
+
+    None
+}
+
+// Taxa level aware
+fn root_calc(
+    graph: &TaxonomyGraph,
+    start: NodeIndex,
+    end: NodeIndex,
+    root: NodeIndex,
+) -> Option<usize> {
+    let mut cur_node = start;
+    let mut path = vec![cur_node];
+    while cur_node != root {
+        let edges = graph.edges_directed(cur_node, Incoming);
+
+        // Make sure there is only one parent
+        let edges = edges.collect::<Vec<_>>();
+        if edges.len() > 1 {
+            panic!("More than one parent");
+        }
+
+        if edges.len() == 0 {
+            log::debug!("No Parent: {} {} {}",
+                cur_node.index(),
+                start.index(),
+                end.index()
+            );
+            panic!("No parent");
+        }
+
+        let parent = edges[0].source();
+        path.push(parent);
+        cur_node = parent;
+    }
+
+    let mut path2 = vec![end];
+    let mut cur_node = end;
+    while cur_node != root {
+        let edges = graph.edges_directed(cur_node, Incoming);
+        // Make sure there is only one parent
+        let edges = edges.collect::<Vec<_>>();
+        if edges.len() > 1 {
+            panic!("More than one parent");
+        }
+
+        let parent = edges[0].source();
+        path2.push(parent);
+        cur_node = parent;
+    }
+
+    let mut common = 0;
+    for (i, node) in path.iter().enumerate() {
+        if path2.contains(node) {
+            common = i;
+            break;
+        }
+    }
+
+    let mut common2 = 0;
+    for (i, node) in path2.iter().enumerate() {
+        if path.contains(node) {
+            common2 = i;
+            break;
+        }
+    }
+
+    Some(path.len() + path2.len() +1 - common + common2)
+}
+
 pub struct BatchGenerator<const D: usize> {
-    pub graph: Arc<Graph<u32, (), Undirected, u32>>,
+    pub root: NodeIndex,
+    pub graph: Arc<Graph<Taxon, (), Directed, u32>>,
     epoch_size: usize,
-    pub levels: HashMap<u32, TaxaLevel>,
     join_handles: Vec<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
     receiver: crossbeam::channel::Receiver<TaxaDistance<D>>,
-    pub nodes: HashMap<u32, NodeIndex>,
-    pub colors: Vec<Color>,
-    pub levels_in_order: Vec<String>,
-    pub taxa_names: Vec<String>,
+    pub taxa_dist_cache: Arc<TaxaDistCache<D>>,
 }
 
 impl<const D: usize> Dataset<TaxaDistance<D>> for BatchGenerator<D> {
     fn len(&self) -> usize {
-        // Batch size of 1024
         self.epoch_size
     }
 
-    fn get(&self, _index: usize) -> Option<TaxaDistance<D>> {
-        self.receiver.recv().ok()
+    fn get(&self, index: usize) -> Option<TaxaDistance<D>> {
+        // self.receiver.recv().ok()
+        self.taxa_dist_cache.get(index).into()
     }
 
     // Provided methods
@@ -633,6 +893,25 @@ impl<const D: usize> Dataset<TaxaDistance<D>> for BatchGenerator<D> {
 }
 
 impl<const D: usize> BatchGenerator<D> {
+
+    pub fn precache(&self) {
+
+        // Optimal is 10%
+        let cache_warmup_size = self.graph.node_count() / 10;
+
+        // In development mode is less though...
+        let cache_warmup_size = 2048;
+
+        while self.taxa_dist_cache.len() < cache_warmup_size {
+            println!(
+                "Waiting for cache to fill: {}/{}",
+                self.taxa_dist_cache.len(),
+                cache_warmup_size
+            );
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+
     pub fn shutdown(&mut self) -> Result<(), &'static str> {
         self.shutdown
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -651,48 +930,15 @@ impl<const D: usize> BatchGenerator<D> {
 
         Ok(())
     }
-
-    /*
-
-    pub fn testing() -> Self {
-        let mut graph = UnGraph::<u32, (), u32>::with_capacity(100_000, 100_000);
-        let nodes: HashMap<u32, NodeIndex> = (0..100_000_u32)
-            .into_iter()
-            .map(|x| (x, graph.add_node(1)))
-            .collect();
-
-        let mut rng = Xoshiro256PlusPlus::seed_from_u64(1337);
-
-        // Connect nodes to each other in order
-        for i in 0..100_000_u32 {
-            if i > 0 {
-                graph.add_edge(nodes[&(i - 1)], nodes[&i], ());
-            }
-        }
-
-        let levels = HashMap::new();
-
-        Self {
-            graph: Arc::new(graph),
-            rng,
-            epoch_size: 1024,
-            levels,
-        }
-    }
-    */
-
     pub fn valid(&self) -> Self {
         BatchGenerator {
+            root: self.root,
             graph: Arc::clone(&self.graph),
             epoch_size: 2048,
-            levels: self.levels.clone(),
             join_handles: vec![],
             shutdown: Arc::clone(&self.shutdown),
             receiver: self.receiver.clone(),
-            nodes: self.nodes.clone(),
-            colors: self.colors.clone(),
-            levels_in_order: self.levels_in_order.clone(),
-            taxa_names: self.taxa_names.clone(),
+            taxa_dist_cache: Arc::clone(&self.taxa_dist_cache),
         }
     }
 
@@ -701,7 +947,11 @@ impl<const D: usize> BatchGenerator<D> {
     }
 }
 
-pub fn parse_nodes(filename: String) -> (Vec<(u32, u32)>, Vec<String>) {
+// Type alias
+pub type TaxId = u32;
+pub type TaxonRank = String;
+
+pub fn parse_nodes(filename: String) -> (Vec<(TaxId, TaxId)>, Vec<TaxonRank>) {
     let mut taxon_to_parent: Vec<(u32, u32)> = Vec::with_capacity(4_000_000);
     let mut taxon_rank: Vec<String> = Vec::with_capacity(4_000_000);
 
@@ -730,13 +980,15 @@ pub fn parse_nodes(filename: String) -> (Vec<(u32, u32)>, Vec<String>) {
     (taxon_to_parent, taxon_rank)
 }
 
-pub fn parse_names(filename: String) -> (Vec<String>, Vec<u32>) {
-    let mut names: Vec<String> = Vec::with_capacity(3_006_098);
+pub type TaxonName = String;
+
+pub fn parse_names(filename: String) -> HashMap<TaxId, TaxonName> {
+    let mut names = HashMap::default();
 
     let reader = BufReader::new(File::open(filename).expect("Unable to open taxonomy names file"));
 
     let lines = reader.lines();
-    let mut taxids = HashSet::new();
+    let mut taxids = HashSet::default();
 
     for line in lines {
         let split = line
@@ -747,24 +999,14 @@ pub fn parse_names(filename: String) -> (Vec<String>, Vec<u32>) {
 
         let id: usize = split[0].parse().expect("Error converting to number");
         let name: &str = &split[1];
-        let class: &str = &split[3];
+        // let class: &str = &split[3];
 
-        match names.get(id) {
-            None => {
-                names.resize(id + 1, "".to_string());
-                names[id] = name.into();
-                taxids.insert(id as u32);
-            }
-            Some(_) => {
-                if class == "scientific name" {
-                    names[id] = name.into();
-                }
-            }
-        };
+        // Set if only not set (some have multiple names)
+        if !taxids.contains(&id) {
+            names.insert(id as u32, name.to_string());
+            taxids.insert(id);
+        }
     }
 
-    let mut taxids = taxids.into_iter().collect::<Vec<u32>>();
-    taxids.sort_unstable();
-
-    (names, taxids)
+    names
 }
