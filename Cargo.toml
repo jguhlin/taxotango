@@ -24,8 +24,6 @@ mimalloc = "0.1.43"
 zstd = { version = "0.13.2", features = ["zstdmt"] }
 flexi_logger = "0.28.5"
 rerun = "0.18.0"
-fnv = "1.0.7"
-bumpalo = { version = "3.16.0", features = ["collections"] }
 # burn-wgpu = { git = "https://github.com/tracel-ai/burn/tree/main/crates/burn-wgpu", features = ["std"], no-default-features = true }
 
 [profile.release]
@@ -36,11 +34,3 @@ bumpalo = { version = "3.16.0", features = ["collections"] }
 debug = true
 # panic = "abort"
 overflow-checks = true
-
-[dev-dependencies]
-criterion = { version = "0.4", features = ["html_reports"] }
-
-
-[[bench]]
-name = "distance_algorithms"
-harness = false
