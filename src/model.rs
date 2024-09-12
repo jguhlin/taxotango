@@ -7,268 +7,19 @@ use burn::{
     data::dataloader::{batcher::Batcher, DataLoaderBuilder},
     module::AutodiffModule,
     nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig},
-    optim::{
-        adaptor::OptimizerAdaptor, AdamConfig, AdamWConfig, GradientsParams, Optimizer, SgdConfig,
-        SimpleOptimizer,
-    },
+    optim::{AdamConfig, AdamWConfig, GradientsParams, Optimizer, SgdConfig},
     prelude::*,
     record::CompactRecorder,
-    record::Record,
     tensor::backend::AutodiffBackend,
     train::{
         metric::{CpuTemperature, LossMetric},
         LearnerBuilder, RegressionOutput, TrainOutput, TrainStep, ValidStep,
     },
-    LearningRate,
 };
-
-use burn::grad_clipping::GradientClippingConfig;
-use burn::optim::decay::{WeightDecay, WeightDecayConfig};
-use burn::optim::momentum::{Momentum, MomentumConfig, MomentumState};
-
 use nn::loss::MseLoss;
 use nn::{Linear, LinearConfig};
 use rerun::{demo_util::grid, external::glam};
 use serde::{Deserialize, Serialize};
-
-use crate::L2Norm;
-use crate::PoincareDistance;
-
-#[derive(Config)]
-pub struct LrWarmUpLinearDecaySchedulerConfig {
-    initial_lr: LearningRate,
-    // The final learning rate.
-    top_lr: LearningRate,
-    // The number of iterations before reaching the top learning rate.
-    num_iters: usize,
-    // The number of iterations to decay the learning rate.
-    decay_iters: usize,
-    // The minimum learning rate.
-    min_lr: LearningRate,
-}
-
-impl LrWarmUpLinearDecaySchedulerConfig {
-    pub fn init(&self) -> LrWarmUpLinearDecayScheduler {
-        LrWarmUpLinearDecayScheduler {
-            initial_lr: self.initial_lr,
-            top_lr: self.top_lr,
-            num_iters: self.num_iters,
-            decay_iters: self.decay_iters,
-            min_lr: self.min_lr,
-            current_iter: 0,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct LrWarmUpLinearDecayScheduler {
-    initial_lr: LearningRate,
-    top_lr: LearningRate,
-    num_iters: usize,
-    decay_iters: usize,
-    min_lr: LearningRate,
-    current_iter: usize,
-}
-
-impl<B: Backend> LrScheduler<B> for LrWarmUpLinearDecayScheduler {
-    type Record = (LearningRate, f64, usize);
-
-    fn step(&mut self) -> LearningRate {
-        self.current_iter += 1;
-
-        if self.current_iter < self.num_iters {
-            let alpha = self.current_iter as f64 / self.num_iters as f64;
-            let lr = self.initial_lr * (1.0 - alpha) + self.top_lr * alpha;
-            lr
-        } else if self.current_iter < self.num_iters + self.decay_iters {
-            let alpha = (self.current_iter - self.num_iters) as f64 / self.decay_iters as f64;
-            let lr = self.top_lr * (1.0 - alpha) + self.min_lr * alpha;
-            lr
-        } else {
-            self.min_lr
-        }
-    }
-
-    fn to_record(&self) -> Self::Record {
-        (self.initial_lr, self.top_lr, self.current_iter)
-    }
-
-    fn load_record(mut self, record: Self::Record) -> Self {
-        self.initial_lr = record.0;
-        self
-    }
-}
-
-#[derive(Config)]
-pub struct RiemannianSgdConfig {
-    /// [Weight decay](WeightDecayConfig) config.
-    weight_decay: Option<WeightDecayConfig>,
-    /// [Momentum](MomentumConfig) config.
-    momentum: Option<MomentumConfig>,
-    /// [Gradient Clipping](GradientClippingConfig) config.
-    gradient_clipping: Option<GradientClippingConfig>,
-}
-
-#[derive(Clone)]
-pub struct RiemannianSgd<B: Backend> {
-    momentum: Option<Momentum<B>>,
-    weight_decay: Option<WeightDecay<B>>,
-}
-
-/// State of [RiemannianSgd](RiemannianSgd).
-#[derive(Record, Clone)]
-pub struct RiemannianSgdState<B: Backend, const D: usize> {
-    momentum: Option<MomentumState<B, D>>,
-}
-
-impl<B: Backend, const D: usize> RiemannianSgdState<B, D> {
-    pub fn new(momentum: Option<MomentumState<B, D>>) -> Self {
-        Self { momentum }
-    }
-}
-
-impl RiemannianSgdConfig {
-    /// Creates a new [RiemannianSgdConfig](RiemannianSgdConfig) with default values.
-    pub fn init<B: AutodiffBackend, M: AutodiffModule<B>>(
-        &self,
-    ) -> OptimizerAdaptor<RiemannianSgd<B::InnerBackend>, M, B> {
-        let momentum = self.momentum.as_ref().map(Momentum::new);
-        let weight_decay = self.weight_decay.as_ref().map(WeightDecay::new);
-
-        println!("Weight decay? {}", weight_decay.is_some());
-        println!("Momentum? {}", momentum.is_some());
-        println!("Grad Clipping? {}", self.gradient_clipping.is_some());
-
-        let mut optim = OptimizerAdaptor::from(RiemannianSgd {
-            momentum,
-            weight_decay,
-        });
-
-        if let Some(config) = &self.gradient_clipping {
-            optim = optim.with_grad_clipping(config.init());
-        }
-
-        optim
-    }
-}
-
-impl<B: Backend> RiemannianSgd<B> {
-    fn mobius_add<const D: usize>(&self, x: Tensor<B, D>, y: Tensor<B, D>) -> Tensor<B, D> {
-        let x2 = x.clone().powf_scalar(2.0).sum_dim(D - 1);
-        let y2 = y.clone().powf_scalar(2.0).sum_dim(D - 1);
-        let xy = (x.clone() * y.clone()).sum_dim(D - 1);
-
-        let ones = Tensor::<B, D>::ones_like(&x2);
-
-        let num = ((xy.clone().mul_scalar(2.0).add_scalar(1.0) + y2.clone()) * x)
-            + ((ones - x2.clone()) * y);
-        let denom = xy.mul_scalar(2.0).add_scalar(1.0) + (x2 * y2);
-
-        num / denom.clamp_min(1e-15)
-    }
-
-    fn expm<const D: usize>(&self, p: Tensor<B, D>, u: Tensor<B, D>) -> Tensor<B, D> {
-        // Calculate the norm of u
-        let norm = u
-            .clone()
-            .powf_scalar(2.0)
-            .sum_dim(D - 1)
-            .sqrt()
-            .clamp_min(1e-10);
-
-        // Calculate lambda_x(p), which is a scaling factor based on the point p
-        let p_sqnorm = p.clone().powf_scalar(2.0).sum_dim(D - 1);
-        let ones = Tensor::<B, D>::ones_like(&p_sqnorm);
-        let twos = Tensor::<B, D>::full(p_sqnorm.shape(), 2.0, &p.device());
-        let lambda_x = twos / (ones.sub(p_sqnorm)).clamp(1e-15, f64::INFINITY);
-
-        // Scale u by tanh(0.5 * lambda_x(p) * norm) / norm
-        let scaled_u = (lambda_x.mul_scalar(0.5) * norm.clone()).tanh() * u / norm.clamp_min(1e-15);
-
-        // Perform the Möbius addition
-        self.mobius_add(p, scaled_u)
-    }
-
-    // Custom gradient scaling for the Riemannian manifold
-    fn grad<const D: usize>(&self, p: Tensor<B, D>, grad: Tensor<B, D>) -> Tensor<B, D> {
-        // let p_sqnorm = p.powf_scalar(2.0).sum_dim(D - 1);
-        // let ones = Tensor::<B, D>::ones_like(&p_sqnorm);
-        // grad * ((ones - p_sqnorm).powf_scalar(2.0).div_scalar(4.0))
-
-        let p_sqnorm = p.powf_scalar(2.0).sum_dim(D - 1);
-        let scaling = ((Tensor::<B, D>::ones_like(&p_sqnorm).sub(p_sqnorm))
-            .powf_scalar(2.0)
-            .div_scalar(4.0))
-        .clamp_min(1e-12);
-        grad * scaling
-    }
-
-    fn project_to_manifold<const D: usize>(&self, tensor: Tensor<B, D>) -> Tensor<B, D> {
-        // Calculate the L2 norm of the tensor
-        let squared = tensor.clone().powf_scalar(2.0);
-        let sum_squares = squared.sum_dim(D - 1); // Sum across the last dimension
-        let norm = sum_squares.sqrt().clamp(1e-10, 1.0 - 1e-10); // Compute the norm and clamp
-
-        // Normalize the tensor, ensuring it's within the manifold
-        let scaled_tensor = tensor.clone() / norm.clone();
-
-        // Optionally: Only project if norm is significantly different from 1.0
-        let greater_than = Tensor::full([1], 1.0 - 1e-3, &tensor.device());
-        let should_project = norm.clone().max().greater(greater_than).into_scalar();
-        if should_project {
-            scaled_tensor
-        } else {
-            tensor
-        }
-    }
-}
-impl<B: Backend> SimpleOptimizer<B> for RiemannianSgd<B> {
-    type State<const D: usize> = RiemannianSgdState<B, D>;
-
-    fn step<const D: usize>(
-        &self,
-        lr: LearningRate,
-        tensor: Tensor<B, D>,
-        mut grad: Tensor<B, D>,
-        state: Option<Self::State<D>>,
-    ) -> (Tensor<B, D>, Option<Self::State<D>>) {
-        let mut state_momentum = None;
-
-        if let Some(state) = state {
-            state_momentum = state.momentum;
-        }
-
-        if let Some(weight_decay) = &self.weight_decay {
-            grad = weight_decay.transform(grad, tensor.clone());
-        }
-
-        // Apply the custom Riemannian gradient scaling
-        grad = self.grad(tensor.clone(), grad);
-
-        if let Some(momentum) = &self.momentum {
-            let (grad_out, state) = momentum.transform(grad, state_momentum);
-            state_momentum = Some(state);
-            grad = grad_out;
-        }
-
-        let state = RiemannianSgdState::new(state_momentum);
-
-        let delta = grad.mul_scalar(-lr);
-
-        // Update parameters using the exponential map
-        let updated_tensor = self.expm(tensor, delta);
-
-        let projected_tensor = self.project_to_manifold(updated_tensor);
-
-        (projected_tensor, Some(state))
-        // (updated_tensor, Some(state))
-    }
-
-    fn to_device<const D: usize>(mut state: Self::State<D>, device: &B::Device) -> Self::State<D> {
-        state.momentum = state.momentum.map(|state| state.to_device(device));
-        state
-    }
-}
 
 // Define the model configuration
 #[derive(Config)]
@@ -276,6 +27,55 @@ pub struct PoincareTaxonomyEmbeddingModelConfig {
     pub taxonomy_size: usize,
     pub embedding_size: usize,
     // pub layer_norm_eps: f64,
+}
+
+#[derive(Module, Debug, Clone)]
+pub struct PoincareDistance {
+    pub l2_norm: L2Norm,
+}
+
+impl PoincareDistance {
+    pub fn new() -> Self {
+        Self {
+            l2_norm: L2Norm::new(),
+        }
+    }
+
+    pub fn forward<B: Backend>(&self, x: Tensor<B, 3>, y: Tensor<B, 3>) -> Tensor<B, 2> {
+        let x_norm = self.l2_norm.forward(x.clone());
+        let y_norm = self.l2_norm.forward(y.clone());
+
+        let diff_norm = self.l2_norm.forward(x - y).powf_scalar(2.0);
+
+        let num = diff_norm * 2.0;
+        let num = num.add_scalar(1e-12);
+        let ones = Tensor::<B, 3>::ones_like(&x_norm);
+        let denom = (ones.clone() - x_norm.clone().powf_scalar(2.0))
+            * (ones - y_norm.clone().powf_scalar(2.0));
+        let denom = denom.add_scalar(1e-12);
+
+        let distance = num / denom;
+
+        let distance = distance.clamp(1e-12, f32::MAX);
+
+        let distance = distance.squeeze(2);
+
+        acosh(distance.mul_scalar(2.0).add_scalar(1.0))
+    }
+}
+
+#[derive(Module, Debug, Clone)]
+pub struct L2Norm {}
+
+impl L2Norm {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn forward<B: Backend, const N: usize>(&self, x: Tensor<B, N>) -> Tensor<B, N> {
+        // Because you can't take the sqrt of 0
+        x.powf_scalar(2.0).sum_dim(N - 1).clamp(1e-12, f32::MAX).sqrt()
+    }
 }
 
 // Define the model structure
@@ -294,8 +94,8 @@ impl PoincareTaxonomyEmbeddingModelConfig {
     /// Initializes a model with default weights
     pub fn init<B: Backend>(&self, device: &B::Device) -> PoincareTaxonomyEmbeddingModel<B> {
         let initializer = burn::nn::Initializer::Uniform {
-            min: -0.005,
-            max: 0.005,
+            min: -0.05,
+            max: 0.05,
         };
 
         //let layer_norm = LayerNormConfig::new(self.embedding_size)
@@ -448,6 +248,14 @@ impl<B: Backend> ValidStep<TangoBatch<B>, RegressionOutput<B>>
     }
 }
 
+fn acosh<B: Backend, const D: usize>(x: Tensor<B, D>) -> Tensor<B, D> {
+    let x = x.clamp_min(1.0);
+    let x_squared = x.clone().powf_scalar(2.0);
+    let inside_sqrt = x_squared.sub_scalar(1.0).clamp_min(1e-12);
+    let sqrt_term = inside_sqrt.sqrt();
+    (x + sqrt_term).log()
+}
+
 // Training stuff
 #[derive(Config)]
 pub struct TrainingConfig {
@@ -455,10 +263,9 @@ pub struct TrainingConfig {
     // pub optimizer: AdamConfig,
     // pub optimizer: SgdConfig,
     pub optimizer: AdamWConfig,
-    // pub optimizer: RiemannianSgdConfig,
     #[config(default = 2048)]
     pub num_epochs: usize,
-    #[config(default = 1024)]
+    #[config(default = 16384)]
     pub batch_size: usize,
     #[config(default = 1)]
     pub num_workers: usize,
@@ -506,14 +313,6 @@ pub fn train<const D: usize, B: AutodiffBackend>(
 
     log::info!("Creating learner");
 
-    let lr_schedule = LrWarmUpLinearDecaySchedulerConfig {
-        initial_lr: 1e-10,
-        top_lr: 2e-4,
-        num_iters: 40_000, // 100_000 is better, but for testing...
-        decay_iters: 1_000_000,
-        min_lr: 1e-6,
-    };
-
     let learner = LearnerBuilder::new(artifact_dir)
         .metric_train_numeric(LossMetric::new())
         .metric_valid_numeric(LossMetric::new())
@@ -525,9 +324,7 @@ pub fn train<const D: usize, B: AutodiffBackend>(
         .build(
             config.model.init::<B>(&device),
             config.optimizer.init(),
-            lr_schedule.init(),
-            // 1e-5,
-            // burn::lr_scheduler::linear::LinearLrSchedulerConfig::new(4e-3, 1e-6, 10_000).init(),
+            burn::lr_scheduler::linear::LinearLrSchedulerConfig::new(4e-3, 1e-6, 10_000).init(),
         );
 
     log::trace!("Learner built");
@@ -547,31 +344,47 @@ pub fn custom_training_loop<const D: usize, B: AutodiffBackend>(
 ) {
     println!("Starting training loop");
 
-    let optim = AdamWConfig::new();
+    // let rec = rerun::RecordingStreamBuilder::new("rerun_embeddings").spawn().expect("Unable to connect to rerun");
+    // .spawn().expect("Failed to start recording stream");
+
+    // let adamconfig = AdamConfig::new()
+    // .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(1.0)));
+
+    //let sgdconfig = SgdConfig::new()
+    //.with_gradient_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(0.1)));
+
+    let adamwconfig = AdamWConfig::new()
+        .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(1.0)));
 
     let config = PoincareTaxonomyEmbeddingModelConfig {
         taxonomy_size: batch_gen.taxonomy_size(),
-        embedding_size: 2,
+        embedding_size: 8,
     };
 
     B::seed(1337);
 
-    let lr_schedule = LrWarmUpLinearDecaySchedulerConfig {
-        initial_lr: 1e-10,
-        top_lr: 2e-4,
-        num_iters: 20_000, // 100_000 is better, but for testing...
-        decay_iters: 1_000_000,
-        min_lr: 1e-6,
-    };
+    let mut lr =
+        burn::lr_scheduler::linear::LinearLrSchedulerConfig::new(5e-2, 1e-6, 1_000_000).init();
 
-    let config = TrainingConfig::new(config, optim.clone());
+    let config = TrainingConfig::new(config, adamwconfig);
 
     // Create the model and optimizer.
     let mut model: PoincareTaxonomyEmbeddingModel<B> = config.model.init(device);
-    let mut optim = optim.init();
+    let mut optim = config.optimizer.init();
 
     let batcher_train: TangoBatcher<B> = TangoBatcher::<B>::new(device.clone());
     let batcher_valid = TangoBatcher::<B::InnerBackend>::new(device.clone());
+
+    let colors = batch_gen.colors.clone();
+    let taxa_levels_in_order = batch_gen.levels_in_order.clone();
+    let taxa_names = batch_gen.taxa_names.clone();
+
+    // Combine taxa level and taxa name
+    let per_node_string: Vec<String> = taxa_levels_in_order
+        .iter()
+        .zip(taxa_names.iter())
+        .map(|(level, name)| format!("{}: {}", level, name))
+        .collect();
 
     let ds_valid = batch_gen.valid();
 
@@ -586,8 +399,6 @@ pub fn custom_training_loop<const D: usize, B: AutodiffBackend>(
         .shuffle(config.seed)
         .num_workers(config.num_workers)
         .build(ds_valid);
-
-    let mut lr = lr_schedule.init();
 
     // Iterate over our training and validation loop for X epochs.
     for epoch in 1..config.num_epochs + 1 {
@@ -627,7 +438,9 @@ pub fn custom_training_loop<const D: usize, B: AutodiffBackend>(
             let grads = loss.backward();
             let grads = GradientsParams::from_grads(grads, &model);
 
-            model = optim.step(<LrWarmUpLinearDecayScheduler as LrScheduler<B>>::step(&mut lr), model, grads);
+            // Update the model using the optimizer.
+            // model = optim.step(config.learning_rate, model, grads);
+            model = optim.step(LrScheduler::<B>::step(&mut lr), model, grads);
         }
 
         // Get the model without autodiff.
@@ -669,4 +482,110 @@ pub fn inference<B: Backend>(artifact_dir: &str, device: B::Device, item: TaxaDi
 
     println!("Inference");
     println!("Predicted {} Expected {}", output, batch.distances);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::{autodiff::Autodiff, Wgpu};
+    use burn::tensor::Tensor;
+
+    #[test]
+    fn test_poincare_distance() {
+        type MyBackend = Wgpu<f32, i32>;
+        let device = burn::backend::wgpu::WgpuDevice::default();
+
+        let x = Tensor::<MyBackend, 3, Float>::from_data(
+            [[[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]],
+            &device,
+        );
+        let y = Tensor::<MyBackend, 3, Float>::from_data(
+            [[[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]]],
+            &device,
+        );
+
+        let distance = poincare_distance(x, y);
+
+        let expected =
+            Tensor::<MyBackend, 2, Float>::from_data([[1.31696], [1.31696], [1.31696]], &device);
+
+        // println!("{}", distance);
+        // println!("{}", expected);
+
+        let equals = distance.equal(expected).all();
+        // let equals = equals.into_data().value[0];
+
+        //assert!(equals);
+    }
+
+    #[test]
+    fn test_acosh() {
+        type MyBackend = Wgpu<f32, i32>;
+        let device = burn::backend::wgpu::WgpuDevice::default();
+
+        let x = Tensor::<MyBackend, 3, Float>::from_data(
+            [[[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]],
+            &device,
+        );
+        let y = Tensor::<MyBackend, 3, Float>::from_data(
+            [[[1.0, 1.0], [1.0, 1.0], [5.0, 5.0]]],
+            &device,
+        );
+
+        let distance = poincare_distance(x, y);
+
+        let expected =
+            Tensor::<MyBackend, 2, Float>::from_data([[13.588997, 13.588997, 16.80787]], &device);
+
+        let equals = distance.clone().equal(expected).all();
+        let equals = equals.into_scalar();
+
+        println!("{}", distance);
+
+        assert!(equals);
+
+        let x = Tensor::<MyBackend, 3, Float>::from_data(
+            [[[0.005, 0.002], [0.01, 0.26], [0.51, 0.0872]]],
+            &device,
+        );
+        let y = Tensor::<MyBackend, 3, Float>::from_data(
+            [[[0.008, 0.004], [0.015, 0.268], [0.19, 0.00007]]],
+            &device,
+        );
+
+        let distance = poincare_distance(x, y);
+
+        let expected = Tensor::<MyBackend, 2, Float>::from_data(
+            [[0.01022465, 0.028696949, 1.0654087]],
+            &device,
+        );
+
+        let equals = distance.clone().equal(expected).all();
+        let equals = equals.into_scalar();
+
+        println!("{}", distance);
+
+        assert!(equals);
+
+        let x = Tensor::<MyBackend, 3, Float>::from_data(
+            [[[-0.005, -0.002], [-0.01, -0.26], [-0.51, -0.0872]]],
+            &device,
+        );
+        let y = Tensor::<MyBackend, 3, Float>::from_data(
+            [[[0.008, 0.004], [0.015, 0.268], [0.19, 0.00007]]],
+            &device,
+        );
+
+        let distance = poincare_distance(x, y);
+
+        let expected =
+            Tensor::<MyBackend, 2, Float>::from_data([[0.04050305, 1.4711125, 2.0157838]], &device);
+
+        let equals = distance.clone().equal(expected).all();
+        let equals = equals.into_scalar();
+
+        println!("{}", distance);
+
+        assert!(equals);
+    }
 }

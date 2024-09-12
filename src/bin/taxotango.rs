@@ -1,7 +1,7 @@
-use mimalloc::MiMalloc;
+// use mimalloc::MiMalloc;
 
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+// #[global_allocator]
+// static GLOBAL: MiMalloc = MiMalloc;
 
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use burn::backend::{autodiff::Autodiff, libtorch::LibTorchDevice, LibTorch, Wgpu};
 use burn::data::dataloader::batcher::Batcher;
 use burn::data::dataset::Dataset;
-use burn::optim::{AdamWConfig, SgdConfig};
+use burn::optim::AdamWConfig;
 use burn::prelude::*;
 use burn::record::{CompactRecorder, Recorder};
 use burn::tensor::Tensor;
@@ -73,20 +73,13 @@ fn main() {
             build_taxonomy_graph_generator(nodes_file, names_file, 1);
 
         // Distance from Root(1) to Peripitdae(27564)
-        let root_idx = generator.root;
-        let peripitdae_idx = generator.graph.node_indices().find(|&idx| {
-            generator
-                .graph
-                .node_weight(idx)
-                .unwrap()
-                .name
-                .contains("Peripitidae")
-        }).unwrap();
+        let root_idx = generator.nodes.get(&1).unwrap();
+        let peripitdae_idx = generator.nodes.get(&27564).unwrap();
 
         let distance = astar(
             Arc::as_ref(&generator.graph),
-            root_idx,
-            |node| node == peripitdae_idx,
+            *root_idx,
+            |node| node == *peripitdae_idx,
             |_| 1,
             |_| 0,
         )
@@ -125,11 +118,11 @@ fn main() {
     let nodes_file = "/mnt/data/data/nt/taxdmp/nodes.dmp";
     let names_file = "/mnt/data/data/nt/taxdmp/names.dmp";
 
-    let mut generator = build_taxonomy_graph_generator(nodes_file, names_file, 18);
+    let mut generator = build_taxonomy_graph_generator(nodes_file, names_file, 52); 
 
     let config = PoincareTaxonomyEmbeddingModelConfig {
         taxonomy_size: generator.taxonomy_size(),
-        embedding_size: 4,
+        embedding_size: 8,
     };
 
     // type MyBackend = Wgpu<f32, i32>;
@@ -143,8 +136,8 @@ fn main() {
 
     // Use custom training loop
     if custom {
-        generator.precache();
-        custom_training_loop::<8, MyAutodiffBackend>(generator, &device);
+        custom_training_loop::<4, MyAutodiffBackend>(generator, &device);
+
         return;
     }
 
@@ -168,23 +161,50 @@ fn main() {
 
         let output = model.forward(batch.origins, batch.branches);
         println!("{}", output);
-        generator.shutdown().expect("Failed to shutdown generator");
+        generator.shutdown();
     } else {
-        let optim = AdamWConfig::new()
-            .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(1.0)));
+        let adamwconfig = AdamWConfig::new();
+        // .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(1.0)));
 
-        // let optim = crate::model::RiemannianSgdConfig::new();
-        // let optim = SgdConfig::new();
-
-        generator.precache();
-
-        crate::model::train::<8, MyAutodiffBackend>(
+        crate::model::train::<4, MyAutodiffBackend>(
             "/mnt/data/data/taxontango_training",
-            crate::model::TrainingConfig::new(config, optim),
+            crate::model::TrainingConfig::new(config, adamwconfig),
             generator,
             device,
         );
 
         // crate::model::custom_training_loop::<MyAutodiffBackend>(generator, &device);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_batcher() {
+        let generator = BatchGenerator::testing();
+
+        let config = PoincareTaxonomyEmbeddingModelConfig {
+            taxonomy_size: generator.taxonomy_size(),
+            embedding_size: 3,
+        };
+
+        type MyBackend = Wgpu<f32, i32>;
+
+        let device = burn::backend::wgpu::WgpuDevice::default();
+
+        let model = config.init::<MyBackend>(&device);
+
+        let tb = TangoBatcher::new(device);
+        let batch = tb.batch(
+            (0..10)
+                .map(|i| generator.get(i).unwrap())
+                .collect::<Vec<_>>(),
+        );
+
+        let output = model.forward(batch.origins, batch.branches);
+        // println!("{:#?}", output);
+        println!("{}", output);
     }
 }
