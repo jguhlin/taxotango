@@ -8,12 +8,12 @@ use taxotangolib::*;
 fn criterion_benchmark(c: &mut Criterion) {
     let nodes_file = "/mnt/data/data/nt/taxdmp/nodes.dmp";
     let names_file = "/mnt/data/data/nt/taxdmp/names.dmp";
-    let (graph, node_indices, node_indices_per_taxa_level, taxa_names, levels, levels_in_order, nodes, colors) =
+    let (graph, root) =
         build_taxonomy_graph(nodes_file, names_file);
 
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(1337);
 
-    let starting_node = nodes.get(&1).unwrap();
+    let starting_node = root;
 
     let mut group = c.benchmark_group("Random Walk Depth 6 Benchmark");
     group.sample_size(100);
@@ -110,7 +110,7 @@ fn criterion_benchmark(c: &mut Criterion) {
 }
 
 fn random_walk_alt<R: Rng>(
-    graph: &Graph<u32, (), Directed, u32>,
+    graph: &Graph<Taxon, (), Directed, u32>,
     rng: &mut R,
     start: NodeIndex,
     depth: usize,
@@ -155,7 +155,7 @@ fn random_walk_alt<R: Rng>(
 }
 
 fn random_walk1<R: Rng>(
-    graph: &Graph<u32, (), Directed, u32>,
+    graph: &Graph<Taxon, (), Directed, u32>,
     rng: &mut R,
     start: NodeIndex,
     depth: usize,
@@ -225,7 +225,7 @@ fn random_walk1<R: Rng>(
 
 // Use binary heap for visited nodes...
 fn random_walk2<R: Rng>(
-    graph: &Graph<u32, (), Directed, u32>,
+    graph: &Graph<Taxon, (), Directed, u32>,
     rng: &mut R,
     start: NodeIndex,
     depth: usize,
@@ -296,7 +296,7 @@ fn random_walk2<R: Rng>(
 
 // Binary heap didn't help, try something else...
 fn random_walk3<R: Rng>(
-    graph: &Graph<u32, (), Directed, u32>,
+    graph: &Graph<Taxon, (), Directed, u32>,
     rng: &mut R,
     start: NodeIndex,
     depth: usize,

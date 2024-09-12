@@ -24,7 +24,7 @@ fn main() {
     let debug = false;
     let infer = false;
     let view = false;
-    let custom = true;
+    let custom = false;
 
     if view {
         let rec = rerun::RecordingStreamBuilder::new("rerun_embeddings")
@@ -73,13 +73,20 @@ fn main() {
             build_taxonomy_graph_generator(nodes_file, names_file, 1);
 
         // Distance from Root(1) to Peripitdae(27564)
-        let root_idx = generator.nodes.get(&1).unwrap();
-        let peripitdae_idx = generator.nodes.get(&27564).unwrap();
+        let root_idx = generator.root;
+        let peripitdae_idx = generator.graph.node_indices().find(|&idx| {
+            generator
+                .graph
+                .node_weight(idx)
+                .unwrap()
+                .name
+                .contains("Peripitidae")
+        }).unwrap();
 
         let distance = astar(
             Arc::as_ref(&generator.graph),
-            *root_idx,
-            |node| node == *peripitdae_idx,
+            root_idx,
+            |node| node == peripitdae_idx,
             |_| 1,
             |_| 0,
         )
