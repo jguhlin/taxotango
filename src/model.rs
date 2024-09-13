@@ -458,9 +458,9 @@ pub struct TrainingConfig {
     // pub optimizer: RiemannianSgdConfig,
     #[config(default = 2048)]
     pub num_epochs: usize,
-    #[config(default = 1024)]
+    #[config(default = 65536)]
     pub batch_size: usize,
-    #[config(default = 1)]
+    #[config(default = 6)]
     pub num_workers: usize,
     #[config(default = 1337002)]
     pub seed: u64,
@@ -557,11 +557,11 @@ pub fn custom_training_loop<const D: usize, B: AutodiffBackend>(
     B::seed(1337);
 
     let lr_schedule = LrWarmUpLinearDecaySchedulerConfig {
-        initial_lr: 1e-10,
-        top_lr: 2e-4,
-        num_iters: 20_000, // 100_000 is better, but for testing...
-        decay_iters: 1_000_000,
-        min_lr: 1e-6,
+        initial_lr: 1e-12,
+        top_lr: 8e-3,
+        num_iters: 500_000, // 100_000 is better, but for testing...
+        decay_iters: 10_000_000,
+        min_lr: 1e-4,
     };
 
     let config = TrainingConfig::new(config, optim.clone());

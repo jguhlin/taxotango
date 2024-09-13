@@ -1,6 +1,6 @@
 use bumpalo::Bump;
 use burn::data::dataset::{Dataset, DatasetIterator};
-use crossbeam::channel::bounded;
+use crossbeam::channel::{bounded, unbounded};
 use petgraph::adj::NodeIndices;
 use petgraph::algo::astar;
 use petgraph::graph::{NodeIndex, UnGraph};
@@ -225,7 +225,7 @@ pub fn build_taxonomy_graph(
     // Remove any that have no neighbors
     let mut removed = 0;
     for (i, ni) in nodes.iter() {
-        let neighbors = graph.neighbors(*ni);
+        let neighbors = graph.neighbors_undirected(*ni);
         if neighbors.count() == 0 {
             graph.remove_node(*ni);
             removed += 1;
@@ -249,51 +249,76 @@ pub fn build_taxonomy_graph(
 // Store the taxa dist training element from each node in the graph, and update when given an new element
 // Allows for training to continue even if new data is not yet ready
 pub struct TaxaDistCache<const D: usize> {
-    pub cache: Arc<RwLock<Vec<TaxaDistance<D>>>>,
+    pub cache: Arc<RwLock<Vec<Option<TaxaDistance<D>>>>>,
     pub last_used: Arc<AtomicUsize>,
+    pub highest_entry: Arc<AtomicUsize>,
+    pub rx: Arc<crossbeam::channel::Receiver<(usize, TaxaDistance<D>)>>,
+    pub tx: Arc<crossbeam::channel::Sender<(usize, TaxaDistance<D>)>>,
+
 }
 
 impl<const D: usize> TaxaDistCache<D> {
     pub fn with_capacity(capacity: usize) -> Self {
+
+        let (tx, rx) = unbounded();
+
         Self {
-            cache: Arc::new(RwLock::new(Vec::with_capacity(capacity))),
+            cache: Arc::new(RwLock::new(vec![None; capacity])),
             last_used: Arc::new(AtomicUsize::new(0)),
+            highest_entry: Arc::new(AtomicUsize::new(0)),
+            rx: Arc::new(rx),
+            tx: Arc::new(tx),
         }
     }
 
     pub fn update(&self, i: usize, element: TaxaDistance<D>) {
-        let mut cache = self.cache.write().unwrap();
-        if cache.len() <= i {
-            cache.resize(i + 1, element);
-        } else {
-            cache[i] = element;
-        }
+        self.tx.send((i, element)).unwrap();
 
-        if i == 0 {
-            log::debug!("Cache has started to fill...");
-        }
+        if self.rx.len() > 8192 * 2 {
+            let mut highest = self.highest_entry.load(std::sync::atomic::Ordering::Relaxed);
+            let mut cache = self.cache.write().unwrap();
+            while let Ok((i, element)) = self.rx.try_recv() {
+                highest = highest.max(i);
+                cache[i] = Some(element);
+
+                if i == 0 {
+                    log::debug!("Starting to fill again");
+                }
+            }
+
+            self.highest_entry.store(highest, std::sync::atomic::Ordering::Relaxed);
+        }        
     }
 
     pub fn len(&self) -> usize {
-        self.cache.read().unwrap().len()
+        self.highest_entry.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn get(&self, i: usize) -> TaxaDistance<D> {
         let cache = self.cache.read().unwrap();
 
-        if i >= cache.len() {
-            if self.last_used.load(std::sync::atomic::Ordering::Relaxed) >= cache.len() {
-                self.last_used
-                    .store(0, std::sync::atomic::Ordering::Relaxed);
-            }
-
-            cache[self
-                .last_used
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)]
-            .clone()
-        } else {
-            cache[i].clone()
+        if let Some(x) = &cache[i] {
+            return x.clone()
         }
+
+        let mut val = None;
+        let mut last_used = self.last_used.load(std::sync::atomic::Ordering::Relaxed);
+        let mut highest = self.highest_entry.load(std::sync::atomic::Ordering::Relaxed);
+
+        while val.is_none() {
+            if let Some(x) = &cache[last_used] {
+                val = Some(x.clone());
+            } else {
+                last_used += 1;
+                if last_used >= highest {
+                    last_used = 0;
+                }
+            }
+        }
+
+        self.last_used.store(last_used, std::sync::atomic::Ordering::Relaxed);
+
+        val.unwrap()        
     }
 }
 
@@ -335,7 +360,6 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
             let mut local_excluded = HashSet::default();
             let mut branches = [0; D];
             let mut distances = [0; D];
-            let mut depths = vec![None; graph.node_count()];
 
             loop {
                 if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -354,52 +378,23 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
                 local_excluded.clear();
                 local_excluded.insert(idx);
 
-                // Nearby samples
-                for i in 0..D / 2 {
-                    let mut depth = rng.gen_range(1..8);
+                let nodes = random_walk_bfs(
+                    Arc::as_ref(&graph),
+                    &mut rng,
+                    idx,
+                    8,
+                    &local_excluded,
+                    D,
+                );
 
-                    let mut node = None;
-                    let mut tries = 0;
-                    while node.is_none() {
-                        if tries > 10 {
-                            depth += 1;
-                        }
-
-                        if tries > 1000 {
-                            log::debug!("Node {} has no neighbors - random_walk_bfs search", idx.index());
-                            
-                            let all_neighbors = graph.neighbors_undirected(idx).collect::<Vec<_>>();
-                            log::debug!("All Neighbors: {:?}", all_neighbors);
-                            log::debug!("Excluded: {:?}", local_excluded);
-
-                            let node = graph[idx].clone();
-
-                            log::debug!("Node is at level: {:?}", node.rank);
-                            log::debug!("Node name is {:?}", node.name);
-
-                            break;
-                        }
-
-                        tries += 1;
-                        node = random_walk_bfs(
-                            Arc::as_ref(&graph),
-                            &mut rng,
-                            idx,
-                            depth,
-                            &local_excluded,
-                            &mut depths,
-                        );
-                        depths.iter_mut().for_each(|x| *x = None);
-                    }
-
-                    let node = node.unwrap();
-
-                    local_excluded.insert(node.0);
-                    branches[i] = node.0.index() as u32;
-                    distances[i] = node.1;
+                for (n, (ni, i)) in nodes.unwrap().iter().enumerate() {
+                    branches[n] = ni.index() as u32;
+                    distances[n] = *i;
                 }
 
                 // Far away samples
+                // todo this calculates distance to root for the origin for each distant node,
+                // this is inefficient
                 let all_nodes_read = all_nodes.read().unwrap();
                 for i in D / 2..D {
                     let end = *all_nodes_read.choose(&mut rng).unwrap();
@@ -461,11 +456,12 @@ fn random_walk_bfs<R: Rng>(
     start: NodeIndex,
     depth: usize,
     excluded_nodes: &HashSet<NodeIndex>,
-    depths: &mut Vec<Option<usize>>,
-) -> Option<(NodeIndex, u32)> {
+    n: usize, // How many to return
+) -> Option<Vec<(NodeIndex, u32)>> {
     let mut current_depth;
 
     let mut candidates = Vec::new();
+    let mut results = Vec::new();
 
     for neighbor in graph.neighbors_undirected(start) {
         candidates.push((neighbor, 1_u32));
@@ -491,10 +487,17 @@ fn random_walk_bfs<R: Rng>(
         .collect::<Vec<_>>();
 
     if !filtered_candidates.is_empty() {
-        Some(**filtered_candidates.choose(rng).unwrap())
+        while results.len() < n {
+            // Weight by depth
+            let dist = WeightedIndex::new(filtered_candidates.iter().map(|x| x.1)).unwrap();
+            let next_node = filtered_candidates[dist.sample(rng)];
+            results.push(*next_node);
+        }
     } else {
-        None
+        panic!();
     }
+
+    Some(results)
 }
 
 fn random_walk<R: Rng>(
@@ -900,7 +903,7 @@ impl<const D: usize> BatchGenerator<D> {
         let cache_warmup_size = self.graph.node_count() / 10;
 
         // In development mode is less though...
-        let cache_warmup_size = 2048;
+        // let cache_warmup_size = 2048;
 
         while self.taxa_dist_cache.len() < cache_warmup_size {
             println!(

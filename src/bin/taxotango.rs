@@ -125,17 +125,18 @@ fn main() {
     let nodes_file = "/mnt/data/data/nt/taxdmp/nodes.dmp";
     let names_file = "/mnt/data/data/nt/taxdmp/names.dmp";
 
-    let mut generator = build_taxonomy_graph_generator(nodes_file, names_file, 18);
+    let mut generator = build_taxonomy_graph_generator(nodes_file, names_file, 12);
 
     let config = PoincareTaxonomyEmbeddingModelConfig {
         taxonomy_size: generator.taxonomy_size(),
-        embedding_size: 4,
+        embedding_size: 2,
     };
 
     // type MyBackend = Wgpu<f32, i32>;
 
     tch::maybe_init_cuda();
     type MyBackend = LibTorch<f32, i8>;
+
     type MyAutodiffBackend = Autodiff<MyBackend>;
 
     // let device = burn::backend::wgpu::WgpuDevice::default();
@@ -144,7 +145,7 @@ fn main() {
     // Use custom training loop
     if custom {
         generator.precache();
-        custom_training_loop::<8, MyAutodiffBackend>(generator, &device);
+        custom_training_loop::<16, MyAutodiffBackend>(generator, &device);
         return;
     }
 
@@ -178,7 +179,7 @@ fn main() {
 
         generator.precache();
 
-        crate::model::train::<8, MyAutodiffBackend>(
+        crate::model::train::<16, MyAutodiffBackend>(
             "/mnt/data/data/taxontango_training",
             crate::model::TrainingConfig::new(config, optim),
             generator,
