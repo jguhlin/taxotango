@@ -5,9 +5,9 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 use std::sync::Arc;
 
-// todo fusion
-// use burn_fusion::Fusion;
-use burn::backend::{autodiff::Autodiff, libtorch::LibTorchDevice, LibTorch, Wgpu};
+use burn::backend::{autodiff::Autodiff, Wgpu};
+use burn::backend::libtorch::{LibTorchDevice, LibTorch};
+// use burn_cuda::{Cuda, CudaDevice};
 use burn::data::dataloader::batcher::Batcher;
 use burn::data::dataset::Dataset;
 use burn::optim::{AdamWConfig, SgdConfig};
@@ -125,7 +125,7 @@ fn main() {
     let nodes_file = "/mnt/data/data/nt/taxdmp/nodes.dmp";
     let names_file = "/mnt/data/data/nt/taxdmp/names.dmp";
 
-    let mut generator = build_taxonomy_graph_generator(nodes_file, names_file, 12);
+    let mut generator = build_taxonomy_graph_generator(nodes_file, names_file, 24);
 
     let config = PoincareTaxonomyEmbeddingModelConfig {
         taxonomy_size: generator.taxonomy_size(),
@@ -137,15 +137,24 @@ fn main() {
     tch::maybe_init_cuda();
     type MyBackend = LibTorch<f32, i8>;
 
+    // type MyBackend = Cuda<f32, i32>;
+
     type MyAutodiffBackend = Autodiff<MyBackend>;
+
+    // let device = CudaDevice::default();
 
     // let device = burn::backend::wgpu::WgpuDevice::default();
     let device = LibTorchDevice::Cuda(0);
 
+    // burn::backend::wgpu::init_sync::<burn::backend::wgpu::Vulkan>(
+        //&device,
+        //Default::default(),
+    //);
+
     // Use custom training loop
     if custom {
         generator.precache();
-        custom_training_loop::<16, MyAutodiffBackend>(generator, &device);
+        custom_training_loop::<8, MyAutodiffBackend>(generator, &device);
         return;
     }
 
@@ -179,7 +188,7 @@ fn main() {
 
         generator.precache();
 
-        crate::model::train::<16, MyAutodiffBackend>(
+        crate::model::train::<8, MyAutodiffBackend>(
             "/mnt/data/data/taxontango_training",
             crate::model::TrainingConfig::new(config, optim),
             generator,

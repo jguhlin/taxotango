@@ -246,6 +246,7 @@ pub fn build_taxonomy_graph(
 
 }
 
+/*
 // Store the taxa dist training element from each node in the graph, and update when given an new element
 // Allows for training to continue even if new data is not yet ready
 pub struct TaxaDistCache<const D: usize> {
@@ -320,7 +321,7 @@ impl<const D: usize> TaxaDistCache<D> {
 
         val.unwrap()        
     }
-}
+} */
 
 pub fn build_taxonomy_graph_generator<const D: usize>(
     nodes_file: &str,
@@ -328,10 +329,9 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
     threads: usize,
 ) -> BatchGenerator<D> {
     let (graph, root) = build_taxonomy_graph(nodes_file, names_file);
+    let (tx, rx) = bounded(8192 * 1024);
 
-    let (tx, rx) = bounded(threads * 8);
-
-    let taxa_dist_cache: Arc<TaxaDistCache<D>> = Arc::new(TaxaDistCache::with_capacity(graph.node_count()));
+    // let taxa_dist_cache: Arc<TaxaDistCache<D>> = Arc::new(TaxaDistCache::with_capacity(graph.node_count()));
 
     // Spawn threads
     let mut jhs = Vec::with_capacity(threads);
@@ -353,7 +353,7 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
         let mut rng = rng.clone();
         let current = Arc::clone(&current);
         let all_nodes = Arc::clone(&all_nodes);
-        let taxa_dist_cache = Arc::clone(&taxa_dist_cache);
+        // let taxa_dist_cache = Arc::clone(&taxa_dist_cache);
         let root = root.clone();
 
         let jh = std::thread::spawn(move || {
@@ -396,16 +396,12 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
                 // todo this calculates distance to root for the origin for each distant node,
                 // this is inefficient
                 let all_nodes_read = all_nodes.read().unwrap();
+                let origin_dist_to_root = dist_to_root(Arc::as_ref(&graph), idx, root);
                 for i in D / 2..D {
                     let end = *all_nodes_read.choose(&mut rng).unwrap();
-                    // if let Some(distance) = dfs_distance_alt_taxalevel(Arc::as_ref(&graph), idx, end, &node_indices_levels) {
-                    if let Some(distance) = root_calc(Arc::as_ref(&graph), idx, end, root) {
+                    let end_dist_to_root = dist_to_root(Arc::as_ref(&graph), end, root);
                         branches[i] = end.index() as u32;
-                        distances[i] = distance as u32;
-                    } else {
-                        // If path not found, try another random node
-                        continue;
-                    }
+                        distances[i] = remove_common_path(&origin_dist_to_root, &end_dist_to_root) as u32;
                 }
 
                 // None of the distances should be 0
@@ -432,7 +428,8 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
                 // let tax_ids_debug = taxa_dist.branches.iter().map(|x| graph.raw_nodes()[*x as usize].weight.tax_id).collect::<Vec<_>>();
                 // log::debug!("Origin: {} {} - Branches TaxID: {:?} - Distances: {:?} - Names: {:?} - Tax IDs: {:?}", graph.raw_nodes()[taxa_dist.origin as usize].weight.name.clone(), origin_tax_id, branches_debug, taxa_dist.distances, names, tax_ids_debug);
 
-                taxa_dist_cache.update(idx.index(), taxa_dist.clone());
+                // taxa_dist_cache.update(idx.index(), taxa_dist.clone());
+                tx.send(taxa_dist).unwrap();
             }
         });
 
@@ -445,8 +442,8 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
         graph,
         join_handles: jhs,
         shutdown,
-        receiver: rx,
-        taxa_dist_cache,
+        rx,
+        // taxa_dist_cache,
     }
 }
 
@@ -797,6 +794,28 @@ fn dfs_distance_alt_taxalevel(
 }
 
 // Taxa level aware
+fn dist_to_root(
+    graph: &TaxonomyGraph,
+    origin: NodeIndex,
+    root: NodeIndex,
+) -> Vec<NodeIndex> {
+    let mut cur_node = origin;
+    let mut path = vec![cur_node];
+    while cur_node != root {
+        let edges = graph.edges_directed(cur_node, Incoming);
+
+        let edges = edges.collect::<Vec<_>>();
+
+        let parent = edges[0].source();
+        path.push(parent);
+        cur_node = parent;
+    }
+
+    path
+    
+}
+
+// Taxa level aware
 fn root_calc(
     graph: &TaxonomyGraph,
     start: NodeIndex,
@@ -862,14 +881,38 @@ fn root_calc(
     Some(path.len() + path2.len() +1 - common + common2)
 }
 
+pub fn remove_common_path(
+    path1: &Vec<NodeIndex>,
+    path2: &Vec<NodeIndex>,
+) -> usize {
+
+    let mut common = 0;
+    for (i, node) in path1.iter().enumerate() {
+        if path2.contains(node) {
+            common = i;
+            break;
+        }
+    }
+
+    let mut common2 = 0;
+    for (i, node) in path2.iter().enumerate() {
+        if path1.contains(node) {
+            common2 = i;
+            break;
+        }
+    }
+
+    path1.len() + path2.len() + 1 - common + common2
+}
+
 pub struct BatchGenerator<const D: usize> {
     pub root: NodeIndex,
     pub graph: Arc<Graph<Taxon, (), Directed, u32>>,
     epoch_size: usize,
     join_handles: Vec<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
-    receiver: crossbeam::channel::Receiver<TaxaDistance<D>>,
-    pub taxa_dist_cache: Arc<TaxaDistCache<D>>,
+    rx: crossbeam::channel::Receiver<TaxaDistance<D>>,
+    // pub taxa_dist_cache: Arc<TaxaDistCache<D>>,
 }
 
 impl<const D: usize> Dataset<TaxaDistance<D>> for BatchGenerator<D> {
@@ -879,7 +922,8 @@ impl<const D: usize> Dataset<TaxaDistance<D>> for BatchGenerator<D> {
 
     fn get(&self, index: usize) -> Option<TaxaDistance<D>> {
         // self.receiver.recv().ok()
-        self.taxa_dist_cache.get(index).into()
+        // self.taxa_dist_cache.get(index).into()
+        self.rx.recv().ok()
     }
 
     // Provided methods
@@ -905,6 +949,7 @@ impl<const D: usize> BatchGenerator<D> {
         // In development mode is less though...
         // let cache_warmup_size = 2048;
 
+        /*
         while self.taxa_dist_cache.len() < cache_warmup_size {
             println!(
                 "Waiting for cache to fill: {}/{}",
@@ -912,7 +957,18 @@ impl<const D: usize> BatchGenerator<D> {
                 cache_warmup_size
             );
             std::thread::sleep(std::time::Duration::from_secs(1));
+        } */
+
+       while self.rx.len() < cache_warmup_size {
+            println!(
+                "Waiting for cache to fill: {}/{}",
+                self.rx.len(),
+                cache_warmup_size
+            );
+            std::thread::sleep(std::time::Duration::from_secs(1));
         }
+
+        println!("Cache filled");
     }
 
     pub fn shutdown(&mut self) -> Result<(), &'static str> {
@@ -940,8 +996,8 @@ impl<const D: usize> BatchGenerator<D> {
             epoch_size: 2048,
             join_handles: vec![],
             shutdown: Arc::clone(&self.shutdown),
-            receiver: self.receiver.clone(),
-            taxa_dist_cache: Arc::clone(&self.taxa_dist_cache),
+            rx: self.rx.clone(),
+            // taxa_dist_cache: Arc::clone(&self.taxa_dist_cache),
         }
     }
 
