@@ -509,8 +509,8 @@ pub fn train<const D: usize, B: AutodiffBackend>(
     let lr_schedule = LrWarmUpLinearDecaySchedulerConfig {
         initial_lr: 1e-10,
         top_lr: 2e-4,
-        num_iters: 40_000, // 100_000 is better, but for testing...
-        decay_iters: 1_000_000,
+        num_iters: 10_000, // 100_000 is better, but for testing...
+        decay_iters: 100_000,
         min_lr: 1e-6,
     };
 

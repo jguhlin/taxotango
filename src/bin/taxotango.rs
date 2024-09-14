@@ -129,7 +129,7 @@ fn main() {
 
     let config = PoincareTaxonomyEmbeddingModelConfig {
         taxonomy_size: generator.taxonomy_size(),
-        embedding_size: 2,
+        embedding_size: 4,
     };
 
     // type MyBackend = Wgpu<f32, i32>;
@@ -154,7 +154,7 @@ fn main() {
     // Use custom training loop
     if custom {
         generator.precache();
-        custom_training_loop::<8, MyAutodiffBackend>(generator, &device);
+        custom_training_loop::<16, MyAutodiffBackend>(generator, &device);
         return;
     }
 
@@ -188,7 +188,7 @@ fn main() {
 
         generator.precache();
 
-        crate::model::train::<8, MyAutodiffBackend>(
+        crate::model::train::<16, MyAutodiffBackend>(
             "/mnt/data/data/taxontango_training",
             crate::model::TrainingConfig::new(config, optim),
             generator,
