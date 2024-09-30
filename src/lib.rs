@@ -1,9 +1,6 @@
-use bumpalo::Bump;
 use burn::data::dataset::{Dataset, DatasetIterator};
-use crossbeam::channel::{bounded, unbounded};
-use petgraph::adj::NodeIndices;
-use petgraph::algo::astar;
-use petgraph::graph::{NodeIndex, UnGraph};
+use crossbeam::channel::bounded;
+use petgraph::graph::NodeIndex;
 use petgraph::prelude::*;
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
@@ -11,11 +8,12 @@ use rand::seq::SliceRandom;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use rerun::Color;
 
+use std::hash::Hash;
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 
 use fnv::FnvHashMap as HashMap;
@@ -26,6 +24,9 @@ pub use model::*;
 
 pub mod layers;
 pub use layers::*;
+
+pub mod optimizers;
+pub use optimizers::*;
 
 pub enum TaxonomyWriterMessage {
     Write(Vec<(NodeIndex, NodeIndex, u8)>),
@@ -159,19 +160,26 @@ impl TaxaLevel {
 
 pub type TaxonomyGraph = Graph<Taxon, (), Directed, u32>;
 
-#[derive(Hash, Eq, PartialEq, Debug, Clone)]
+#[derive(Eq, PartialEq, Debug, Clone)]
 pub struct Taxon {
     pub tax_id: u32,
     pub parent: u32,
     pub rank: TaxaLevel,
     pub name: String,
+    pub color: Color,
+    pub rank_str: String,
+}
+
+impl Hash for Taxon {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.tax_id.hash(state);
+    }
 }
 
 pub fn build_taxonomy_graph(
     nodes_file: &str,
     names_file: &str,
 ) -> (TaxonomyGraph, NodeIndex) {
-
     let taxa_names = parse_names(names_file.to_string());
     let nodes = parse_nodes(nodes_file.to_string());
 
@@ -191,7 +199,10 @@ pub fn build_taxonomy_graph(
 
     let nodes: Vec<u32> = edges.iter().flat_map(|(x, y)| [x, y]).copied().collect();
     let nodes = nodes.into_iter().collect::<HashSet<u32>>();
-    let nodes = nodes.into_iter().collect::<Vec<u32>>();
+    let mut nodes = nodes.into_iter().collect::<Vec<u32>>();
+    nodes.sort();
+
+    assert!(nodes[0] == 1, "Root node is not 1");
 
     log::debug!("Total Nodes: {}", nodes.len());
     log::debug!("Total Taxa Names: {}", taxa_names.len());
@@ -210,30 +221,52 @@ pub fn build_taxonomy_graph(
             parent: taxa_parents[&x],
             rank: TaxaLevel::from_str(&taxa_ranks[&x]),
             name: taxa_names[&x].clone(),
+            color: TaxaLevel::from_str(&taxa_ranks[&x]).color(),
+            rank_str: taxa_ranks[&x].clone(),
         }
-    ).collect::<Vec<_>>();
+    )
+    // If tax_id == 1 set rank to Root
+    .map(|x| if x.tax_id == 1 { Taxon { rank: TaxaLevel::Root, ..x } } else { x })
+    .filter(|x| x.rank != TaxaLevel::NoRank)
+    .collect::<Vec<_>>();
 
-    let nodes: HashMap<u32, NodeIndex> = nodes.into_iter().map(|x| (x.tax_id, graph.add_node(x))).collect();
-    let node_indices: HashMap<NodeIndex, u32> = nodes.iter().map(|(x, y)| (*y, *x)).collect();
+    assert!(nodes.len() > 0, "Accidentally filtered out all nodes");
 
-    let root = nodes[&1];
+    let nodes_set = nodes.iter().map(|x| x.tax_id).collect::<HashSet<_>>();
+
+    assert!(nodes_set.len() > 0, "Accidentally filtered out all nodes");
+    assert!(nodes_set.contains(&1), "Root node not in set");
+
+    // Update edges to only those that are in the set
+    let edges = edges.into_iter().filter(|(x, y)| nodes_set.contains(x) && nodes_set.contains(y)).collect::<Vec<_>>();
+    let edges_set = edges.iter().flat_map(|(x, y)| [*x, *y]).collect::<HashSet<_>>();
+
+    // Make sure all nodes have an edge
+    let nodes = nodes.into_iter().filter(|x| edges_set.contains(&x.tax_id)).collect::<Vec<_>>();    
+
+    println!("Length of nodes: {}", nodes.len());
+
+    for node in nodes.iter() {
+        graph.add_node(node.clone());
+    }
+
+    // Get tax_id of root
+    // let root = nodes.iter().find(|x| x.rank == TaxaLevel::Root).unwrap().tax_id;
+
+    // let nodes: HashMap<u32, NodeIndex> = nodes.into_iter().map(|x| (x.tax_id, graph.add_node(x))).collect();
+    // let node_indices: HashMap<NodeIndex, u32> = nodes.iter().map(|(x, y)| (*y, *x)).collect();
+
+    // let root = nodes[&root];
+
+    let node_indices = graph.node_indices().map(|x| (graph[x].tax_id, x)).collect::<HashMap<_, _>>();
 
     for (x, y) in edges {
-        graph.add_edge(nodes[&y], nodes[&x], ());
-    }
-
-    // Remove any that have no neighbors
-    let mut removed = 0;
-    for (i, ni) in nodes.iter() {
-        let neighbors = graph.neighbors_undirected(*ni);
-        if neighbors.count() == 0 {
-            graph.remove_node(*ni);
-            removed += 1;
+        // x and y must still be in the set
+        if !node_indices.contains_key(&x) || !node_indices.contains_key(&y) {
+            continue;
         }
-    }
 
-    if removed > 0 {
-        log::info!("Removed {} nodes with no neighbors", removed);
+        graph.add_edge(node_indices[&x], node_indices[&y], ());
     }
 
     log::info!(
@@ -242,86 +275,9 @@ pub fn build_taxonomy_graph(
         graph.edge_count()
     );
 
-    (graph, root)
+    (graph, node_indices[&1])
 
 }
-
-/*
-// Store the taxa dist training element from each node in the graph, and update when given an new element
-// Allows for training to continue even if new data is not yet ready
-pub struct TaxaDistCache<const D: usize> {
-    pub cache: Arc<RwLock<Vec<Option<TaxaDistance<D>>>>>,
-    pub last_used: Arc<AtomicUsize>,
-    pub highest_entry: Arc<AtomicUsize>,
-    pub rx: Arc<crossbeam::channel::Receiver<(usize, TaxaDistance<D>)>>,
-    pub tx: Arc<crossbeam::channel::Sender<(usize, TaxaDistance<D>)>>,
-
-}
-
-impl<const D: usize> TaxaDistCache<D> {
-    pub fn with_capacity(capacity: usize) -> Self {
-
-        let (tx, rx) = unbounded();
-
-        Self {
-            cache: Arc::new(RwLock::new(vec![None; capacity])),
-            last_used: Arc::new(AtomicUsize::new(0)),
-            highest_entry: Arc::new(AtomicUsize::new(0)),
-            rx: Arc::new(rx),
-            tx: Arc::new(tx),
-        }
-    }
-
-    pub fn update(&self, i: usize, element: TaxaDistance<D>) {
-        self.tx.send((i, element)).unwrap();
-
-        if self.rx.len() > 8192 * 2 {
-            let mut highest = self.highest_entry.load(std::sync::atomic::Ordering::Relaxed);
-            let mut cache = self.cache.write().unwrap();
-            while let Ok((i, element)) = self.rx.try_recv() {
-                highest = highest.max(i);
-                cache[i] = Some(element);
-
-                if i == 0 {
-                    log::debug!("Starting to fill again");
-                }
-            }
-
-            self.highest_entry.store(highest, std::sync::atomic::Ordering::Relaxed);
-        }        
-    }
-
-    pub fn len(&self) -> usize {
-        self.highest_entry.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    pub fn get(&self, i: usize) -> TaxaDistance<D> {
-        let cache = self.cache.read().unwrap();
-
-        if let Some(x) = &cache[i] {
-            return x.clone()
-        }
-
-        let mut val = None;
-        let mut last_used = self.last_used.load(std::sync::atomic::Ordering::Relaxed);
-        let mut highest = self.highest_entry.load(std::sync::atomic::Ordering::Relaxed);
-
-        while val.is_none() {
-            if let Some(x) = &cache[last_used] {
-                val = Some(x.clone());
-            } else {
-                last_used += 1;
-                if last_used >= highest {
-                    last_used = 0;
-                }
-            }
-        }
-
-        self.last_used.store(last_used, std::sync::atomic::Ordering::Relaxed);
-
-        val.unwrap()        
-    }
-} */
 
 pub fn build_taxonomy_graph_generator<const D: usize>(
     nodes_file: &str,
@@ -341,9 +297,13 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
     let mut shutdown = Arc::new(AtomicBool::new(false));
     let current = Arc::new(AtomicUsize::new(0));
 
-    let mut all_nodes = Arc::new(RwLock::new(Vec::new()));
+    let mut all_nodes = Arc::new(graph.node_indices().collect::<Vec<_>>());
 
-    all_nodes = Arc::new(RwLock::new(graph.node_indices().collect::<Vec<_>>()));
+    // Print first 10
+    log::debug!("First 10 Nodes: {:?}", &all_nodes[0..10]);
+
+    // Print last 10
+    log::debug!("Last 10 Nodes: {:?}", &all_nodes[all_nodes.len()-10..]);
 
     for threadno in 0..threads {
         let tx = tx.clone();
@@ -352,14 +312,14 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
         rng.long_jump();
         let mut rng = rng.clone();
         let current = Arc::clone(&current);
-        let all_nodes = Arc::clone(&all_nodes);
         // let taxa_dist_cache = Arc::clone(&taxa_dist_cache);
         let root = root.clone();
+        let all_nodes = Arc::clone(&all_nodes);
 
         let jh = std::thread::spawn(move || {
-            let mut local_excluded = HashSet::default();
-            let mut branches = [0; D];
-            let mut distances = [0; D];
+            // let mut local_excluded = HashSet::default();
+            let mut nearby = [0; 1];
+            let mut distant = [0; D];
 
             loop {
                 if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -368,67 +328,32 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
 
                 let idx = loop {
                     let i = current.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if i >= all_nodes.read().unwrap().len() {
+                    if i >= all_nodes.len() {
                         current.store(0, std::sync::atomic::Ordering::Relaxed);
                         continue;
                     }
-                    break all_nodes.read().unwrap()[i];
+                    break all_nodes[i];
                 };
 
-                local_excluded.clear();
-                local_excluded.insert(idx);
-
-                let nodes = random_walk_bfs(
-                    Arc::as_ref(&graph),
-                    &mut rng,
-                    idx,
-                    8,
-                    &local_excluded,
-                    D,
-                );
-
-                for (n, (ni, i)) in nodes.unwrap().iter().enumerate() {
-                    branches[n] = ni.index() as u32;
-                    distances[n] = *i;
-                }
-
-                // Far away samples
-                // todo this calculates distance to root for the origin for each distant node,
-                // this is inefficient
-                let all_nodes_read = all_nodes.read().unwrap();
-                let origin_dist_to_root = dist_to_root(Arc::as_ref(&graph), idx, root);
-                for i in D / 2..D {
-                    let end = *all_nodes_read.choose(&mut rng).unwrap();
-                    let end_dist_to_root = dist_to_root(Arc::as_ref(&graph), end, root);
-                        branches[i] = end.index() as u32;
-                        distances[i] = remove_common_path(&origin_dist_to_root, &end_dist_to_root) as u32;
-                }
-
-                // None of the distances should be 0
-                if distances.iter().any(|&x| x == 0) {
-                    // If so, show all branches and distances, and the origin
-                    log::debug!(
-                        "Branches: {:?}, Distances: {:?}, Origin: {}",
-                        branches,
-                        distances,
-                        idx.index()
-                    );
-                    panic!();
+                let neighbors = graph.neighbors_undirected(idx);
+                let nodes = neighbors.collect::<Vec<_>>();
+                assert!(nodes.len() > 0, "Node has no neighbors");
+                // Pick a random neighbor
+                let nodes = nodes.choose(&mut rng);
+                nearby[0] = nodes.unwrap().index() as u32;
+                
+                for i in 0..D {
+                    let end = all_nodes.choose(&mut rng).unwrap();
+                    // let end_dist_to_root = dist_to_root(Arc::as_ref(&graph), end, root);
+                    distant[i] = end.index() as u32;
                 }
 
                 let taxa_dist = TaxaDistance {
                     origin: idx.index() as u32,
-                    branches,
-                    distances,
+                    nearby,
+                    distant,
                 };
 
-                // let names = taxa_dist.branches.iter().map(|x| graph.raw_nodes()[*x as usize].weight.name.clone()).collect::<Vec<_>>();
-                // let branches_debug = taxa_dist.branches.iter().map(|x| graph.raw_nodes()[*x as usize].weight.tax_id).collect::<Vec<_>>();
-                // let origin_tax_id = graph.raw_nodes()[idx.index() as usize].weight.tax_id;
-                // let tax_ids_debug = taxa_dist.branches.iter().map(|x| graph.raw_nodes()[*x as usize].weight.tax_id).collect::<Vec<_>>();
-                // log::debug!("Origin: {} {} - Branches TaxID: {:?} - Distances: {:?} - Names: {:?} - Tax IDs: {:?}", graph.raw_nodes()[taxa_dist.origin as usize].weight.name.clone(), origin_tax_id, branches_debug, taxa_dist.distances, names, tax_ids_debug);
-
-                // taxa_dist_cache.update(idx.index(), taxa_dist.clone());
                 tx.send(taxa_dist).unwrap();
             }
         });
@@ -447,462 +372,64 @@ pub fn build_taxonomy_graph_generator<const D: usize>(
     }
 }
 
-fn random_walk_bfs<R: Rng>(
-    graph: &TaxonomyGraph,
-    rng: &mut R,
-    start: NodeIndex,
-    depth: usize,
-    excluded_nodes: &HashSet<NodeIndex>,
-    n: usize, // How many to return
-) -> Option<Vec<(NodeIndex, u32)>> {
-    let mut current_depth;
-
-    let mut candidates = Vec::new();
-    let mut results = Vec::new();
-
-    for neighbor in graph.neighbors_undirected(start) {
-        candidates.push((neighbor, 1_u32));
-    }
-
-    while let Some(node) = candidates.pop() {
-        current_depth = node.1;
-
-        // Stop early once we have passed the desired depth
-        if current_depth as usize > depth {
-            break;
-        }
-
-        for neighbor in graph.neighbors_undirected(node.0) {
-            candidates.push((neighbor, (current_depth + 1) as u32));
-        }
-    }
-
-    // Remove excluded nodes
-    let filtered_candidates = candidates
-        .iter()
-        .filter(|x| !excluded_nodes.contains(&x.0))
-        .collect::<Vec<_>>();
-
-    if !filtered_candidates.is_empty() {
-        while results.len() < n {
-            // Weight by depth
-            let dist = WeightedIndex::new(filtered_candidates.iter().map(|x| x.1)).unwrap();
-            let next_node = filtered_candidates[dist.sample(rng)];
-            results.push(*next_node);
-        }
-    } else {
-        panic!();
-    }
-
-    Some(results)
+pub struct BatchGeneratorWeighted<const D: usize> {
+    pub root: NodeIndex,
+    pub graph: Arc<Graph<Taxon, (), Directed, u32>>,
+    epoch_size: usize,
+    join_handles: Vec<JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
+    rx: crossbeam::channel::Receiver<TaxaDistance<D>>,
+    pub sampler: WeightedIndex<f64>,
 }
 
-fn random_walk<R: Rng>(
-    graph: &TaxonomyGraph,
-    rng: &mut R,
-    start: NodeIndex,
-    depth: usize,
-    excluded_nodes: &HashSet<NodeIndex>,
-) -> Option<(NodeIndex, u32)> {
-    let mut current_node = start;
-    let mut visited_nodes = vec![current_node];
+impl<const D: usize> Dataset<TaxaDistance<D>> for BatchGenerator<D> {
+    fn len(&self) -> usize {
+        self.epoch_size
+    }
 
-    for curdepth in 1..depth {
-        let mut neighbors: Vec<_> = graph
-            .neighbors_undirected(current_node)
-            .filter(|&n| !visited_nodes.contains(&n))
-            .collect();
+    fn get(&self, index: usize) -> Option<TaxaDistance<D>> {
+        // self.receiver.recv().ok()
+        // self.taxa_dist_cache.get(index).into()
+        self.rx.recv().ok()
+    }
 
-        if depth == 1 && neighbors.is_empty() {
-            log::debug!("Node {} has no neighbors", current_node.index());
-        }
+    // Provided methods
+    fn is_empty(&self) -> bool {
+        self.graph.node_count() == 0
+    }
 
-        if neighbors.is_empty() {
-            if start != current_node {
-                return Some((current_node, curdepth as u32));
-            } else {
-                return None;
-            }
-        }
+    fn iter(&self) -> DatasetIterator<'_, TaxaDistance<D>>
+    where
+        Self: Sized,
+    {
+        DatasetIterator::new(self)
+    }
+}
 
-        neighbors = neighbors
-            .into_iter()
-            .filter(|x| !excluded_nodes.contains(x))
-            .collect();
+impl<const D: usize> BatchGeneratorWeighted<D> {
 
-        if neighbors.is_empty() {
-            if start != current_node {
-                return Some((current_node, curdepth as u32));
-            } else {
-                return None;
-            }
-        }
+    pub fn shutdown(&mut self) -> Result<(), &'static str> {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
-        /*        let mut neighbors_neighbor_count = neighbors
-        .iter()
-        .map(|x| graph.neighbors(*x).count())
-        .collect::<Vec<_>>(); */
+        let mut jhs = Vec::new();
+        std::mem::swap(&mut jhs, &mut self.join_handles);
 
-        // if curdepth < depth - 1 {
-        // Means we have more than one level to go, so try to avoid dead ends
-        // Filter neighbors that have more than 1 neighbor
-        // And filter neighbor counts to use as weights
-
-        /*
-        neighbors = neighbors_neighbor_count
-            .iter()
-            .enumerate()
-            .filter(|(_, x)| **x > 1)
-            .map(|(i, _)| neighbors[i])
-            .collect();
-
-        neighbors_neighbor_count = neighbors_neighbor_count
-            .into_iter()
-            .filter(|x| *x > 1)
-            .collect();
-        */
-        // }
-
-        if neighbors.is_empty() {
-            if start != current_node {
-                return Some((current_node, curdepth as u32));
-            } else {
-                return None;
-            }
-        }
-
-        // let dist = WeightedIndex::new(neighbors_neighbor_count).unwrap();
-
-        // let next_node = neighbors[dist.sample(&mut rng)];
-
-        let mut next_node = rng.gen_range(0..neighbors.len());
-        while curdepth < depth - 1 && graph.neighbors(neighbors[next_node]).count() == 1 {
-            if neighbors.len() == 1 {
-                current_node = neighbors[next_node];
-                if start != current_node {
-                    return Some((current_node, curdepth as u32));
-                } else {
-                    return None;
+        for jh in jhs {
+            match jh.join() {
+                Ok(_) => {}
+                Err(_) => {
+                    return Err("Error joining batch generator thread");
                 }
             }
-
-            // Remove from neighbors
-            neighbors.remove(next_node);
-
-            next_node = rng.gen_range(0..neighbors.len());
         }
 
-        visited_nodes.push(neighbors[next_node]);
-        current_node = neighbors[next_node];
+        Ok(())
     }
 
-    Some((current_node, depth as u32))
-}
-
-fn random_walk_alt<R: Rng>(
-    graph: &TaxonomyGraph,
-    rng: &mut R,
-    start: NodeIndex,
-    depth: usize,
-    excluded_nodes: &HashSet<NodeIndex>,
-) -> Option<(NodeIndex, u32)> {
-    let mut current_node = start;
-    let mut visited_nodes = HashSet::default();
-    visited_nodes.insert(current_node);
-
-    for current_depth in 0..depth {
-        let neighbors: Vec<_> = graph
-            .neighbors(current_node)
-            .filter(|&n| !visited_nodes.contains(&n) && !excluded_nodes.contains(&n))
-            .collect();
-
-        if neighbors.is_empty() {
-            return if current_node != start {
-                Some((current_node, current_depth as u32))
-            } else {
-                None
-            };
-        }
-
-        current_node = *neighbors.choose(rng).unwrap();
-        visited_nodes.insert(current_node);
+    pub fn taxonomy_size(&self) -> usize {
+        self.graph.node_count()
     }
-
-    Some((current_node, depth as u32))
-}
-
-fn bfs_distance(
-    graph: &TaxonomyGraph,
-    start: NodeIndex,
-    end: NodeIndex,
-) -> Option<usize> {
-    // Initialize BFS
-    let mut bfs = Bfs::new(graph, start);
-    let mut distances = vec![None; graph.node_count()];
-    distances[start.index()] = Some(0);
-
-    // Perform BFS
-    while let Some(node) = bfs.next(graph) {
-        let current_distance = distances[node.index()].unwrap();
-
-        if node == end {
-            return Some(current_distance);
-        }
-
-        for neighbor in graph.neighbors(node) {
-            if distances[neighbor.index()].is_none() {
-                distances[neighbor.index()] = Some(current_distance + 1);
-            }
-        }
-    }
-
-    // If we finish BFS without finding the target node, return None
-    None
-}
-
-fn bfs_distance_alt(
-    graph: &TaxonomyGraph,
-    start: NodeIndex,
-    end: NodeIndex,
-    max_depth: Option<usize>,
-) -> Option<usize> {
-    let mut queue = VecDeque::new();
-    let mut visited = HashSet::default();
-
-    queue.push_back((start, 0));
-    visited.insert(start);
-
-    while let Some((node, distance)) = queue.pop_front() {
-        if node == end {
-            return Some(distance);
-        }
-
-        if let Some(max) = max_depth {
-            if distance >= max {
-                continue;
-            }
-        }
-
-        for neighbor in graph.neighbors(node) {
-            if visited.insert(neighbor) {
-                queue.push_back((neighbor, distance + 1));
-            }
-        }
-    }
-
-    None
-}
-
-fn dfs_distance(
-    graph: &TaxonomyGraph,
-    start: NodeIndex,
-    end: NodeIndex,
-) -> Option<usize> {
-    // Initialize BFS
-    let mut bfs = Dfs::new(graph, start);
-    let mut distances = vec![None; graph.node_count()];
-    distances[start.index()] = Some(0);
-
-    // Perform DFS
-    while let Some(node) = bfs.next(graph) {
-        let current_distance = distances[node.index()].unwrap();
-
-        if node == end {
-            return Some(current_distance);
-        }
-
-        for neighbor in graph.neighbors(node) {
-            if distances[neighbor.index()].is_none() {
-                distances[neighbor.index()] = Some(current_distance + 1);
-            }
-        }
-    }
-
-    // If we finish DFS without finding the target node, return None
-    None
-}
-
-fn dfs_distance_alt(
-    graph: &TaxonomyGraph,
-    start: NodeIndex,
-    end: NodeIndex,
-) -> Option<usize> {
-    let mut queue = VecDeque::new();
-    let mut visited = HashSet::default();
-    queue.push_back((start, 0));
-    visited.insert(start);
-
-    while let Some((node, distance)) = queue.pop_front() {
-        if node == end {
-            return Some(distance);
-        }
-
-        for neighbor in graph.neighbors(node) {
-            if visited.insert(neighbor) {
-                queue.push_back((neighbor, distance + 1));
-            }
-        }
-    }
-
-    None
-}
-
-// Taxa level aware
-fn dfs_distance_alt_taxalevel(
-    graph: &TaxonomyGraph,
-    start: NodeIndex,
-    end: NodeIndex,
-    node_indices_levels: &Arc<HashMap<NodeIndex, TaxaLevel>>,
-) -> Option<usize> {
-    let mut queue = VecDeque::new();
-    let mut visited = HashSet::default();
-    queue.push_back((start, 0));
-    visited.insert(start);
-
-    let target_taxa_level = node_indices_levels[&end];
-    let start_taxa_level = node_indices_levels[&start];
-
-    let no_deeper_than = target_taxa_level.max(start_taxa_level);
-
-    log::debug!(
-        "Start: {:?} - End: {:?} - Target Level: {:?} - Start Level: {:?} - No Deeper Than: {:?}",
-        start,
-        end,
-        target_taxa_level,
-        start_taxa_level,
-        no_deeper_than
-    );
-
-
-
-    while let Some((node, distance)) = queue.pop_front() {
-        if node == end {
-            return Some(distance);
-        }
-
-        for neighbor in graph.neighbors(node) {
-            let neighbor_taxa_level = node_indices_levels[&neighbor];
-
-            // If neighbor is deeper than target AND the starting node, skip
-            if neighbor_taxa_level <= no_deeper_than && visited.insert(neighbor) {
-                queue.push_back((neighbor, distance + 1));
-            }
-        }
-    }
-
-    None
-}
-
-// Taxa level aware
-fn dist_to_root(
-    graph: &TaxonomyGraph,
-    origin: NodeIndex,
-    root: NodeIndex,
-) -> Vec<NodeIndex> {
-    let mut cur_node = origin;
-    let mut path = vec![cur_node];
-    while cur_node != root {
-        let edges = graph.edges_directed(cur_node, Incoming);
-
-        let edges = edges.collect::<Vec<_>>();
-
-        let parent = edges[0].source();
-        path.push(parent);
-        cur_node = parent;
-    }
-
-    path
-    
-}
-
-// Taxa level aware
-fn root_calc(
-    graph: &TaxonomyGraph,
-    start: NodeIndex,
-    end: NodeIndex,
-    root: NodeIndex,
-) -> Option<usize> {
-    let mut cur_node = start;
-    let mut path = vec![cur_node];
-    while cur_node != root {
-        let edges = graph.edges_directed(cur_node, Incoming);
-
-        // Make sure there is only one parent
-        let edges = edges.collect::<Vec<_>>();
-        if edges.len() > 1 {
-            panic!("More than one parent");
-        }
-
-        if edges.len() == 0 {
-            log::debug!("No Parent: {} {} {}",
-                cur_node.index(),
-                start.index(),
-                end.index()
-            );
-            panic!("No parent");
-        }
-
-        let parent = edges[0].source();
-        path.push(parent);
-        cur_node = parent;
-    }
-
-    let mut path2 = vec![end];
-    let mut cur_node = end;
-    while cur_node != root {
-        let edges = graph.edges_directed(cur_node, Incoming);
-        // Make sure there is only one parent
-        let edges = edges.collect::<Vec<_>>();
-        if edges.len() > 1 {
-            panic!("More than one parent");
-        }
-
-        let parent = edges[0].source();
-        path2.push(parent);
-        cur_node = parent;
-    }
-
-    let mut common = 0;
-    for (i, node) in path.iter().enumerate() {
-        if path2.contains(node) {
-            common = i;
-            break;
-        }
-    }
-
-    let mut common2 = 0;
-    for (i, node) in path2.iter().enumerate() {
-        if path.contains(node) {
-            common2 = i;
-            break;
-        }
-    }
-
-    Some(path.len() + path2.len() +1 - common + common2)
-}
-
-pub fn remove_common_path(
-    path1: &Vec<NodeIndex>,
-    path2: &Vec<NodeIndex>,
-) -> usize {
-
-    let mut common = 0;
-    for (i, node) in path1.iter().enumerate() {
-        if path2.contains(node) {
-            common = i;
-            break;
-        }
-    }
-
-    let mut common2 = 0;
-    for (i, node) in path2.iter().enumerate() {
-        if path1.contains(node) {
-            common2 = i;
-            break;
-        }
-    }
-
-    path1.len() + path2.len() + 1 - common + common2
 }
 
 pub struct BatchGenerator<const D: usize> {

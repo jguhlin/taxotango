@@ -2,7 +2,69 @@ use core::num;
 
 use burn::prelude::*;
 
-use super::l2norm::L2Norm;
+use super::l2norm::*;
+
+const EPS: f32 = 1e-8;
+const CLAMP_MIN: f32 = 1e-8;
+const CLAMP_MAX: f32 = f32::MAX;
+
+pub fn poincare_distance<B: Backend>(u: Tensor<B, 3>, v: Tensor<B, 3>) -> Tensor<B, 2> {
+    let u_norm = l2_norm(u.clone());
+    let v_norm = l2_norm(v.clone());
+
+    let u_norm_sq = u_norm.clone().powf_scalar(2.0).clamp_max(1.0 - EPS);
+    let v_norm_sq = v_norm.clone().powf_scalar(2.0).clamp_max(1.0 - EPS);
+
+    // println!("U Norm_sq: {}", u_norm_sq);
+    // println!("V Norm_sq: {}", v_norm_sq);
+
+    let euclidean_distance_sq = l2_norm(u - v).powf_scalar(2.0);
+
+    // println!("Euclidean Distance: {}", euclidean_distance_sq);
+
+    let numerator = euclidean_distance_sq.add_scalar(EPS);
+
+    let ones = Tensor::<B, 3>::ones_like(&u_norm);
+    let denominator = (ones.clone() - u_norm_sq) * (ones - v_norm_sq);
+    let denominator = denominator.add_scalar(EPS);
+
+    // println!("Numerator: {}", numerator);
+    // println!("Denominator: {}", denominator);
+
+    let mut distance = numerator / denominator;
+    // println!("Distance: {}", distance);
+
+    distance = distance.mul_scalar(2.0).add_scalar(1.0);
+
+    let distance = distance.clamp_min(1.0 + EPS);
+
+    let distance = distance.squeeze(2);
+
+    // println!("Distances before acosh: {}", distance);
+    
+    acosh(distance)
+}
+
+pub fn acosh<B: Backend, const D: usize>(x: Tensor<B, D>) -> Tensor<B, D> {
+    // Clamp x to be at least 1 + EPS to ensure x^2 - 1 > 0
+    let x = x.clamp_min(1.0 + EPS);
+
+    // Compute x_squared = x^2 - 1
+    let x_squared = x.clone().powf_scalar(2.0).sub_scalar(1.0);
+
+    let x_squared = x_squared.clamp_min(CLAMP_MIN);
+
+    // debug thing
+    if x_squared.clone().lower_equal_elem(0.0).any().into_scalar() {
+        panic!("x_squared <= 0");
+    }
+
+    // Since x >= 1 + EPS, x_squared > 0, so sqrt is valid
+    let sqrt_term = x_squared.sqrt();
+
+    // Compute acosh(x) = ln(x + sqrt(x^2 - 1))
+    (x + sqrt_term).log()
+}
 
 #[derive(Module, Debug, Clone)]
 pub struct PoincareDistance {

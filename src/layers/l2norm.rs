@@ -1,5 +1,17 @@
 use burn::prelude::*;
 
+const EPS: f32 = 1e-8;
+const CLAMP_MIN: f32 = EPS;
+const CLAMP_MAX: f32 = f32::MAX;
+
+pub fn l2_norm<B: Backend, const N: usize>(x: Tensor<B, N>) -> Tensor<B, N> {
+    x.powf_scalar(2.0)
+        .sum_dim(N - 1)
+        // .clamp(EPS, f32::MAX)
+        .add_scalar(EPS)
+        .sqrt()
+}
+
 #[derive(Module, Debug, Clone)]
 pub struct L2Norm {
     pub eps: f32,

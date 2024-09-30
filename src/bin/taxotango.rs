@@ -5,8 +5,10 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 use std::sync::Arc;
 
-use burn::backend::{autodiff::Autodiff, Wgpu};
+#[cfg(not(debug_assertions))]
 use burn::backend::libtorch::{LibTorchDevice, LibTorch};
+
+use burn::backend::{autodiff::Autodiff, Wgpu};
 // use burn_cuda::{Cuda, CudaDevice};
 use burn::data::dataloader::batcher::Batcher;
 use burn::data::dataset::Dataset;
@@ -24,7 +26,7 @@ fn main() {
     let debug = false;
     let infer = false;
     let view = false;
-    let custom = false;
+    let custom = true;
 
     if view {
         let rec = rerun::RecordingStreamBuilder::new("rerun_embeddings")
@@ -65,6 +67,7 @@ fn main() {
         return;
     }
 
+    /*
     if infer {
         let nodes_file = "/mnt/data/data/nt/taxdmp/nodes.dmp";
         let names_file = "/mnt/data/data/nt/taxdmp/names.dmp";
@@ -107,7 +110,7 @@ fn main() {
 
         generator.shutdown();
         return;
-    }
+    } */
 
     // Highest level of logging is debug
     // Lowest level of logging is error
@@ -127,24 +130,33 @@ fn main() {
 
     let mut generator = build_taxonomy_graph_generator(nodes_file, names_file, 24);
 
-    let config = PoincareTaxonomyEmbeddingModelConfig {
+    let config = PoincareEmbeddingModelConfig {
         taxonomy_size: generator.taxonomy_size(),
-        embedding_size: 4,
+        embedding_size: 3,
     };
 
-    // type MyBackend = Wgpu<f32, i32>;
+    #[cfg(debug_assertions)]
+    type MyBackend = Wgpu<f32, i32>;
 
+    #[cfg(not(debug_assertions))]
     tch::maybe_init_cuda();
+    
+    #[cfg(not(debug_assertions))]
     type MyBackend = LibTorch<f32, i8>;
 
     // type MyBackend = Cuda<f32, i32>;
+
+    // type MyBackend = Wgpu<f32, i32>;
 
     type MyAutodiffBackend = Autodiff<MyBackend>;
 
     // let device = CudaDevice::default();
 
-    // let device = burn::backend::wgpu::WgpuDevice::default();
-    let device = LibTorchDevice::Cuda(0);
+    #[cfg(debug_assertions)]
+    let device = burn::backend::wgpu::WgpuDevice::default();
+
+     #[cfg(not(debug_assertions))]
+     let device = LibTorchDevice::Cuda(0);
 
     // burn::backend::wgpu::init_sync::<burn::backend::wgpu::Vulkan>(
         //&device,
@@ -154,7 +166,7 @@ fn main() {
     // Use custom training loop
     if custom {
         generator.precache();
-        custom_training_loop::<16, MyAutodiffBackend>(generator, &device);
+        custom_training_loop::<2048, MyAutodiffBackend>(generator, &device);
         return;
     }
 
@@ -176,19 +188,22 @@ fn main() {
         println!("{:#?}", batch);
         println!("{:#?}", batch.origins);
 
-        let output = model.forward(batch.origins, batch.branches);
+        // todo fix this
+
+        let output = model.forward(batch.origins);
         println!("{}", output);
         generator.shutdown().expect("Failed to shutdown generator");
     } else {
         let optim = AdamWConfig::new()
             .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(1.0)));
 
-        // let optim = crate::model::RiemannianSgdConfig::new();
+        // let optim = taxotangolib::RiemannianSgdConfig::new();
         // let optim = SgdConfig::new();
+        let optim = taxotangolib::RiemannianAMSGradConfig::new();
 
         generator.precache();
 
-        crate::model::train::<16, MyAutodiffBackend>(
+        crate::model::train::<2048, MyAutodiffBackend>(
             "/mnt/data/data/taxontango_training",
             crate::model::TrainingConfig::new(config, optim),
             generator,
