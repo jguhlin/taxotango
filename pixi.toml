@@ -1,0 +1,15 @@
+[project]
+authors = ["Joseph Guhlin <joseph.guhlin@gmail.com>"]
+channels = ["conda-forge"]
+description = "Add a short description here"
+name = "taxotango"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python = "3.12.*"
+pip = ">=24.2,<25"
+uv = ">=0.4.24,<0.5"
+poetry = ">=1.8.4,<2"

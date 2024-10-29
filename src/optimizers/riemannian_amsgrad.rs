@@ -1,13 +1,13 @@
 use burn::{
-    tensor::{backend::Backend, Tensor},
-    optim::decay::{WeightDecay, WeightDecayConfig},
-    optim::adaptor::OptimizerAdaptor,
-    optim::SimpleOptimizer,
-    grad_clipping::GradientClippingConfig,
-    tensor::backend::AutodiffBackend,
-    module::AutodiffModule,
-    record::Record,
     config::Config,
+    grad_clipping::GradientClippingConfig,
+    module::AutodiffModule,
+    optim::adaptor::OptimizerAdaptor,
+    optim::decay::{WeightDecay, WeightDecayConfig},
+    optim::SimpleOptimizer,
+    record::Record,
+    tensor::backend::AutodiffBackend,
+    tensor::{backend::Backend, Tensor},
     LearningRate,
 };
 
@@ -121,11 +121,9 @@ impl<B: Backend> RiemannianAMSGrad<B> {
 
     /// Scales the Euclidean gradient to obtain the Riemannian gradient.
     fn grad<const D: usize>(&self, p: Tensor<B, D>, grad: Tensor<B, D>) -> Tensor<B, D> {
-        let p_sqnorm = p
-            .powf_scalar(2.0)
-            .sum_dim(D - 1)
-            .unsqueeze();
-        let scaling = ((Tensor::<B, D>::ones_like(&p_sqnorm) - p_sqnorm).powf_scalar(2.0) * 0.25).clamp_min(1e-12);
+        let p_sqnorm = p.powf_scalar(2.0).sum_dim(D - 1).unsqueeze();
+        let scaling = ((Tensor::<B, D>::ones_like(&p_sqnorm) - p_sqnorm).powf_scalar(2.0) * 0.25)
+            .clamp_min(1e-12);
 
         grad * scaling
     }
@@ -178,7 +176,7 @@ impl<B: Backend> SimpleOptimizer<B> for RiemannianAMSGrad<B> {
 
         // Compute v_hat (element-wise maximum of v_hat and v)
         v_hat = v_hat.max_pair(v.clone());
-    
+
         // Compute bias-corrected first moment estimate
         let beta1_t = self.beta1.powi(t as i32);
         let m_hat = m.clone() / (1.0 - beta1_t);

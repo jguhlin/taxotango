@@ -1,13 +1,15 @@
-use burn::{prelude::*, 
-    optim::decay::{WeightDecay, WeightDecayConfig}, 
-    optim::momentum::{Momentum, MomentumConfig, MomentumState}, 
-    optim::adaptor::OptimizerAdaptor,
-    optim::SimpleOptimizer,
-    grad_clipping::GradientClippingConfig, 
-    tensor::backend::AutodiffBackend,
+use burn::{
+    grad_clipping::GradientClippingConfig,
     module::AutodiffModule,
+    optim::adaptor::OptimizerAdaptor,
+    optim::decay::{WeightDecay, WeightDecayConfig},
+    optim::momentum::{Momentum, MomentumConfig, MomentumState},
+    optim::SimpleOptimizer,
+    prelude::*,
     record::Record,
-    LearningRate};
+    tensor::backend::AutodiffBackend,
+    LearningRate,
+};
 
 use crate::l2_norm;
 
@@ -86,7 +88,8 @@ impl<B: Backend> RiemannianSgd<B> {
             .powf_scalar(2.0)
             .sum_dim(D - 1)
             .sqrt()
-            .clamp_min(1e-10);
+            .clamp_min(1e-10)
+            .unsqueeze();
 
         // Calculate lambda_x(p), which is a scaling factor based on the point p
         let p_sqnorm = p.clone().powf_scalar(2.0).sum_dim(D - 1);
@@ -108,29 +111,27 @@ impl<B: Backend> RiemannianSgd<B> {
         // grad * ((ones - p_sqnorm).powf_scalar(2.0).div_scalar(4.0))
 
         let p_sqnorm = p.powf_scalar(2.0).sum_dim(D - 1);
-        let scaling = ((Tensor::<B, D>::ones_like(&p_sqnorm).sub(p_sqnorm))
+        let scaling = (Tensor::<B, D>::ones_like(&p_sqnorm).sub(p_sqnorm))
             .powf_scalar(2.0)
-            .div_scalar(4.0))
-        .clamp_min(1e-12);
+            .div_scalar(4.0);
+            // .clamp_min(1e-12);
         grad * scaling
     }
 
     pub fn project_to_manifold<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
         // Compute norms of embeddings
-        let norms = l2_norm(x.clone());
-    
+        let norms = l2_norm(x.clone()).unsqueeze();
+
         // Create a mask for embeddings with norms >= 1
         let gte_mask = norms.clone().greater_equal_elem(1.0).expand(x.shape());
-    
+
         // Scale embeddings that are outside the unit ball
         let scaled_x = x.clone() / norms;
         let adjusted_x = scaled_x * (1.0 - 1e-5); // Subtract a small value to ensure it's inside
-    
+
         // Replace embeddings outside the unit ball with adjusted ones
         x.mask_where(gte_mask, adjusted_x)
     }
-    
-
 }
 impl<B: Backend> SimpleOptimizer<B> for RiemannianSgd<B> {
     type State<const D: usize> = RiemannianSgdState<B, D>;

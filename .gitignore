@@ -1,2 +1,5 @@
 /target
 *.log
+# pixi environments
+.pixi
+*.egg-info

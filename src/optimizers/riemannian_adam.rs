@@ -1,4 +1,3 @@
-
 /// Example usage of the Riemannian Adam optimizer.
 ///
 /// ```rust
@@ -60,17 +59,16 @@
 ///     }
 /// }
 /// ```
-
 use burn::{
-    tensor::{backend::Backend, Tensor},
-    optim::decay::{WeightDecay, WeightDecayConfig},
-    optim::adaptor::OptimizerAdaptor,
-    optim::SimpleOptimizer,
-    grad_clipping::GradientClippingConfig,
-    tensor::backend::AutodiffBackend,
-    module::AutodiffModule,
-    record::Record,
     config::Config,
+    grad_clipping::GradientClippingConfig,
+    module::AutodiffModule,
+    optim::adaptor::OptimizerAdaptor,
+    optim::decay::{WeightDecay, WeightDecayConfig},
+    optim::SimpleOptimizer,
+    record::Record,
+    tensor::backend::AutodiffBackend,
+    tensor::{backend::Backend, Tensor},
     LearningRate,
 };
 use std::marker::PhantomData;
@@ -161,7 +159,6 @@ impl<B: Backend> RiemannianAdam<B> {
 
     /// Exponential map from the tangent space at point `p` to the manifold.
     fn expm<const D: usize>(&self, p: Tensor<B, D>, u: Tensor<B, D>) -> Tensor<B, D> {
-
         let device = p.device();
 
         let norm = u
@@ -174,24 +171,19 @@ impl<B: Backend> RiemannianAdam<B> {
 
         let p_sqnorm = p.clone().powf_scalar(2.0).sum_dim(D - 1).unsqueeze();
         let ones = Tensor::<B, D>::ones_like(&p_sqnorm);
-        let lambda_p = Tensor::<B, D>::from_floats([2.0], &device) / (ones - p_sqnorm).clamp_min(1e-15);
+        let lambda_p =
+            Tensor::<B, D>::from_floats([2.0], &device) / (ones - p_sqnorm).clamp_min(1e-15);
 
-        let scaled_u = ((lambda_p.clone() * norm.clone() * 0.5).tanh() * u)
-            / norm.clamp_min(1e-15);
+        let scaled_u = ((lambda_p.clone() * norm.clone() * 0.5).tanh() * u) / norm.clamp_min(1e-15);
 
         self.mobius_add(p, scaled_u)
     }
 
     /// Scales the Euclidean gradient to obtain the Riemannian gradient.
     fn grad<const D: usize>(&self, p: Tensor<B, D>, grad: Tensor<B, D>) -> Tensor<B, D> {
-        let p_sqnorm = p
-            .powf_scalar(2.0)
-            .sum_dim(D - 1)
-            .unsqueeze();
-        let scaling = ((Tensor::<B, D>::ones_like(&p_sqnorm) - p_sqnorm)
-            .powf_scalar(2.0)
-            * 0.25)
-        .clamp_min(1e-12);
+        let p_sqnorm = p.powf_scalar(2.0).sum_dim(D - 1).unsqueeze();
+        let scaling = ((Tensor::<B, D>::ones_like(&p_sqnorm) - p_sqnorm).powf_scalar(2.0) * 0.25)
+            .clamp_min(1e-12);
 
         grad * scaling
     }
@@ -236,11 +228,15 @@ impl<B: Backend> SimpleOptimizer<B> for RiemannianAdam<B> {
         grad = self.grad(tensor.clone(), grad);
 
         // Update biased first moment estimate
-        m = m.mul_scalar(self.beta1).add(grad.clone().mul_scalar(1.0 - self.beta1));
+        m = m
+            .mul_scalar(self.beta1)
+            .add(grad.clone().mul_scalar(1.0 - self.beta1));
 
         // Update biased second raw moment estimate
         let grad_squared = grad.clone().powf_scalar(2.0);
-        v = v.mul_scalar(self.beta2).add(grad_squared.mul_scalar(1.0 - self.beta2));
+        v = v
+            .mul_scalar(self.beta2)
+            .add(grad_squared.mul_scalar(1.0 - self.beta2));
 
         // Compute bias-corrected first moment estimate
         let beta1_t = self.beta1.powi(t as i32);
