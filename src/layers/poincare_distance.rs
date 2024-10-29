@@ -2,7 +2,61 @@ use core::num;
 
 use burn::prelude::*;
 
-use super::l2norm::L2Norm;
+use super::l2norm::*;
+
+const EPS: f32 = 1e-12;
+const CLAMP_MIN: f32 = 1e-14;
+const CLAMP_MAX: f32 = f32::MAX;
+
+pub fn poincare_distance<B: Backend>(u: Tensor<B, 3>, v: Tensor<B, 3>) -> Tensor<B, 2> {
+    let u = u.expand(v.shape());
+
+    let u_norm = l2_norm(u.clone());
+    let v_norm = l2_norm(v.clone());
+
+    // If norms >= 1, panic
+    if u_norm.clone().greater_elem(1.0).any().into_scalar() || v_norm.clone().greater_elem(1.0).any().into_scalar() {
+        panic!("Norms greater than 1");
+    }
+
+    let u_norm_sq = u_norm.clone().powf_scalar(2.0);
+    let v_norm_sq = v_norm.clone().powf_scalar(2.0);
+
+    let euclidean_distance_sq = l2_norm(u - v).powf_scalar(2.0);
+
+    let numerator = euclidean_distance_sq;
+
+    // let ones = Tensor::<B, 3>::ones_like(&u_norm);
+    // let denominator = (ones.clone() - u_norm_sq) * (ones - v_norm_sq);
+    let denominator = u_norm_sq.neg().add_scalar(1.0) * v_norm_sq.neg().add_scalar(1.0);
+
+    let mut distance = numerator / denominator;
+
+    distance = distance.mul_scalar(2.0).add_scalar(1.0);
+
+    let distance = distance.clamp_min(1.0 + EPS).squeeze(2);
+
+    acosh(distance)
+}
+
+pub fn acosh<B: Backend, const D: usize>(x: Tensor<B, D>) -> Tensor<B, D> {
+    // Clamp x to be at least 1 + EPS to ensure x^2 - 1 > 0
+    let x = x.clamp_min(1.0 + EPS);
+
+    // Compute x_squared = x^2 - 1
+    let x_squared = x.clone().powf_scalar(2.0).sub_scalar(1.0);
+    let x_squared = x_squared.clamp_min(CLAMP_MIN);
+
+    // Since x >= 1 + EPS, x_squared > 0, so sqrt is valid
+    let sqrt_term = x_squared.sqrt();
+
+    // Compute acosh(x) = ln(x + sqrt(x^2 - 1))
+    let x = (x + sqrt_term).log();
+
+    // Sqrt of 0 derivatives to NaN, so we need to clamp it
+    x.clamp_min(CLAMP_MIN)
+
+}
 
 #[derive(Module, Debug, Clone)]
 pub struct PoincareDistance {
@@ -16,8 +70,8 @@ impl PoincareDistance {
     pub fn new() -> Self {
         Self {
             l2_norm: L2Norm::new(),
-            eps: 1e-12,
-            clamp_min: 1e-12,
+            eps: 1e-8,
+            clamp_min: 1e-8,
             clamp_max: f32::MAX,
         }
     }
@@ -43,7 +97,7 @@ impl PoincareDistance {
         // println!("{}", distance);
 
         let distance = distance.squeeze(2);
-        
+
         // println!("{}", distance);
 
         self.acosh(distance)
@@ -61,8 +115,8 @@ impl PoincareDistance {
 
 #[cfg(test)]
 mod tests {
-    use burn::prelude::*;
     use burn::backend::{Autodiff, Wgpu};
+    use burn::prelude::*;
 
     use super::*;
 
@@ -122,4 +176,3 @@ mod tests {
         }
     }
 }
-

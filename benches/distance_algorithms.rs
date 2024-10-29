@@ -8,8 +8,7 @@ use taxotangolib::*;
 fn criterion_benchmark(c: &mut Criterion) {
     let nodes_file = "/mnt/data/data/nt/taxdmp/nodes.dmp";
     let names_file = "/mnt/data/data/nt/taxdmp/names.dmp";
-    let (graph, root) =
-        build_taxonomy_graph(nodes_file, names_file);
+    let (graph, root) = build_taxonomy_graph(nodes_file, names_file);
 
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(1337);
 

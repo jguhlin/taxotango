@@ -1,16 +1,25 @@
 use burn::prelude::*;
 
+const EPS: f32 = 1e-8;
+const CLAMP_MIN: f32 = EPS;
+const CLAMP_MAX: f32 = f32::MAX;
+
+pub fn l2_norm<B: Backend, const N: usize>(x: Tensor<B, N>) -> Tensor<B, N> {
+    x.powi_scalar(2)
+        .sum_dim(N - 1)
+        .clamp(EPS, f32::MAX)
+        // .add_scalar(EPS)
+        .sqrt()
+}
+
 #[derive(Module, Debug, Clone)]
 pub struct L2Norm {
     pub eps: f32,
-
 }
 
 impl L2Norm {
     pub fn new() -> Self {
-        Self {
-            eps: 1e-12,
-        }
+        Self { eps: 1e-12 }
     }
 
     pub fn forward<B: Backend, const N: usize>(&self, x: Tensor<B, N>) -> Tensor<B, N> {
@@ -24,8 +33,8 @@ impl L2Norm {
 
 #[cfg(test)]
 mod tests {
-    use burn::prelude::*;
     use burn::backend::{Autodiff, Wgpu};
+    use burn::prelude::*;
 
     use super::*;
 
@@ -39,10 +48,9 @@ mod tests {
         let x = Tensor::<Wgpu, 3>::from_data(x, &device);
 
         let y = l2norm.forward(x.clone());
-        
+
         let y = y.into_scalar();
 
         assert_eq!(y, 6.48074069841);
-
     }
 }
